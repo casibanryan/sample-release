@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pivotly-mcp-server": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "pivotly",
+  "description": "Pivotly skills and MCP server: basic mathematics, plus the tools the Pivotly MCP server exposes.",
+  "version": "0.0.0",
+  "author": {
+    "name": "Pivotly"
+  },
+  "license": "UNLICENSED"
+}

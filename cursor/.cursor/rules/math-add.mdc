@@ -1,0 +1,34 @@
+---
+description: Add two or more numbers and report the sum together with its operands.
+alwaysApply: false
+---
+
+# Add
+
+Add numbers and report the sum in a form the reader can check.
+
+## When to use
+
+- The request asks for a sum, total, subtotal, or combined amount.
+- A running total has to be updated with a new value.
+
+## Instructions
+
+1. Parse every operand as a number. Refuse non-numeric input instead of guessing at it.
+2. Add left to right, keeping full precision until the final answer.
+3. Round only at the end, and say what was rounded and to how many places.
+4. Report the operands alongside the result, so the arithmetic can be checked.
+
+## Examples
+
+- `2 + 3` = 5
+- `-4 + 9` = 5
+- `0.1 + 0.2` = 0.3 (rounded from 0.30000000000000004)
+
+## Pitfalls
+
+- **Floating point.** `0.1 + 0.2` is `0.30000000000000004` in every IEEE-754 language.
+  Reporting a raw intermediate sum gives an answer that is technically correct and
+  obviously wrong to the person reading it. Round at the end, and say so.
+- **Mixed units.** Adding 5 kg to 5 lb is not 10 of anything. Convert first, or say the
+  operands are not addable.
