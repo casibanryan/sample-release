@@ -1,0 +1,434 @@
+{
+  "generator": {
+    "name": "@pivotly/plugin",
+    "version": "0.0.0"
+  },
+  "authMode": "none",
+  "serverUrl": "http://localhost:8080/mcp",
+  "digest": "sha256:fa334127bf2651c6938fada2a7f67e6f9b7b1b055f60781812f81ea9c6fe257b",
+  "skills": [
+    {
+      "name": "greeting",
+      "category": "custom",
+      "description": "Greet a person by name, matching the tone and language of the conversation."
+    },
+    {
+      "name": "math-add",
+      "category": "core",
+      "description": "Add two or more numbers and report the sum together with its operands."
+    },
+    {
+      "name": "math-divide",
+      "category": "core",
+      "description": "Divide numbers and report the quotient, refusing division by zero."
+    },
+    {
+      "name": "math-multiply",
+      "category": "core",
+      "description": "Multiply numbers and report the product, flagging any loss of precision."
+    },
+    {
+      "name": "math-subtract",
+      "category": "core",
+      "description": "Subtract numbers and report the difference, stating which operand came first."
+    }
+  ],
+  "packages": [
+    {
+      "client": "claude",
+      "displayName": "Claude Code plugin",
+      "directory": "claude",
+      "kind": "plugin",
+      "skillsDir": "skills",
+      "mcpConfig": {
+        "path": ".mcp.json",
+        "format": "mcpServers",
+        "verified": true
+      },
+      "install": "claude plugin install ./claude",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": "skills/math-add/SKILL.md"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": "skills/math-divide/SKILL.md"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": "skills/math-multiply/SKILL.md"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": "skills/math-subtract/SKILL.md"
+        },
+        {
+          "name": "greeting",
+          "category": "custom",
+          "description": "Greet a person by name, matching the tone and language of the conversation.",
+          "path": "skills/greeting/SKILL.md"
+        }
+      ],
+      "files": [
+        {
+          "path": ".claude-plugin/plugin.json",
+          "sha256": "sha256:2db7969b41bbf13457335843920d35679b41c80806fe2e0a0d3018585b7c4ccd"
+        },
+        {
+          "path": ".mcp.json",
+          "sha256": "sha256:2ce5d509c352329559d607e6b87fa44af483df06c285fa60a68789aab2a7c093"
+        },
+        {
+          "path": "skills/greeting/SKILL.md",
+          "sha256": "sha256:04cc3ac2a95a05143935002ecc37eab41e06188dad5a0ee5399972866dad5fba"
+        },
+        {
+          "path": "skills/math-add/SKILL.md",
+          "sha256": "sha256:7c5a17a43f197f1abe62478f01438d51e6d5d6245d143e49c92487f00bc35262"
+        },
+        {
+          "path": "skills/math-divide/SKILL.md",
+          "sha256": "sha256:f3e6c4a8b5c2727646c4bc119a6ed023792a01345b20b908e1d4de166364997e"
+        },
+        {
+          "path": "skills/math-multiply/SKILL.md",
+          "sha256": "sha256:17183a391969a9e13703ea577878f6400711d453aa2e7dbe84813a5ce83c92a9"
+        },
+        {
+          "path": "skills/math-subtract/SKILL.md",
+          "sha256": "sha256:10d1a8f82a99107f606b3c5550c89420c0e753add77843585fdcf650ee2c0608"
+        }
+      ],
+      "digest": "sha256:340056fa9798bce9055cfa9c98a9345ef27db0da284fed095e1d5e3ca0dfc424"
+    },
+    {
+      "client": "gemini",
+      "displayName": "Gemini CLI",
+      "directory": "gemini",
+      "kind": "overlay",
+      "skillsDir": ".gemini/skills",
+      "mcpConfig": {
+        "path": ".gemini/settings.json",
+        "format": "mcpServers",
+        "verified": false
+      },
+      "install": "copy the contents of gemini/ into your project root",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": ".gemini/skills/math-add.md"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": ".gemini/skills/math-divide.md"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": ".gemini/skills/math-multiply.md"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": ".gemini/skills/math-subtract.md"
+        },
+        {
+          "name": "greeting",
+          "category": "custom",
+          "description": "Greet a person by name, matching the tone and language of the conversation.",
+          "path": ".gemini/skills/greeting.md"
+        }
+      ],
+      "files": [
+        {
+          "path": ".gemini/settings.json",
+          "sha256": "sha256:2ce5d509c352329559d607e6b87fa44af483df06c285fa60a68789aab2a7c093"
+        },
+        {
+          "path": ".gemini/skills/greeting.md",
+          "sha256": "sha256:04cc3ac2a95a05143935002ecc37eab41e06188dad5a0ee5399972866dad5fba"
+        },
+        {
+          "path": ".gemini/skills/math-add.md",
+          "sha256": "sha256:7c5a17a43f197f1abe62478f01438d51e6d5d6245d143e49c92487f00bc35262"
+        },
+        {
+          "path": ".gemini/skills/math-divide.md",
+          "sha256": "sha256:f3e6c4a8b5c2727646c4bc119a6ed023792a01345b20b908e1d4de166364997e"
+        },
+        {
+          "path": ".gemini/skills/math-multiply.md",
+          "sha256": "sha256:17183a391969a9e13703ea577878f6400711d453aa2e7dbe84813a5ce83c92a9"
+        },
+        {
+          "path": ".gemini/skills/math-subtract.md",
+          "sha256": "sha256:10d1a8f82a99107f606b3c5550c89420c0e753add77843585fdcf650ee2c0608"
+        }
+      ],
+      "digest": "sha256:fde1f9bc3374a1562e91b9b5b09dbbc5588b259ad209052c190f84570390ac1e"
+    },
+    {
+      "client": "codex",
+      "displayName": "OpenAI Codex",
+      "directory": "codex",
+      "kind": "overlay",
+      "skillsDir": ".codex/skills",
+      "mcpConfig": {
+        "path": ".codex/config.toml",
+        "format": "toml",
+        "verified": false
+      },
+      "install": "copy the contents of codex/ into your project root",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": ".codex/skills/math-add.md"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": ".codex/skills/math-divide.md"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": ".codex/skills/math-multiply.md"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": ".codex/skills/math-subtract.md"
+        }
+      ],
+      "files": [
+        {
+          "path": ".codex/config.toml",
+          "sha256": "sha256:5e4dd9cc5624095383c4a3e339d0295a30d4190c7c91800980db045a971051c2"
+        },
+        {
+          "path": ".codex/skills/math-add.md",
+          "sha256": "sha256:7c5a17a43f197f1abe62478f01438d51e6d5d6245d143e49c92487f00bc35262"
+        },
+        {
+          "path": ".codex/skills/math-divide.md",
+          "sha256": "sha256:f3e6c4a8b5c2727646c4bc119a6ed023792a01345b20b908e1d4de166364997e"
+        },
+        {
+          "path": ".codex/skills/math-multiply.md",
+          "sha256": "sha256:17183a391969a9e13703ea577878f6400711d453aa2e7dbe84813a5ce83c92a9"
+        },
+        {
+          "path": ".codex/skills/math-subtract.md",
+          "sha256": "sha256:10d1a8f82a99107f606b3c5550c89420c0e753add77843585fdcf650ee2c0608"
+        }
+      ],
+      "digest": "sha256:c33c57023fedc49d2177ad8e99a229859097e4ff007aead6ffaa9becbb6b3dc7"
+    },
+    {
+      "client": "cursor",
+      "displayName": "Cursor",
+      "directory": "cursor",
+      "kind": "overlay",
+      "skillsDir": ".cursor/rules",
+      "mcpConfig": {
+        "path": ".cursor/mcp.json",
+        "format": "mcpServers",
+        "verified": true
+      },
+      "install": "copy the contents of cursor/ into your project root",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": ".cursor/rules/math-add.mdc"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": ".cursor/rules/math-divide.mdc"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": ".cursor/rules/math-multiply.mdc"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": ".cursor/rules/math-subtract.mdc"
+        }
+      ],
+      "files": [
+        {
+          "path": ".cursor/mcp.json",
+          "sha256": "sha256:2ce5d509c352329559d607e6b87fa44af483df06c285fa60a68789aab2a7c093"
+        },
+        {
+          "path": ".cursor/rules/math-add.mdc",
+          "sha256": "sha256:6544f1c2ce65836e3bb1c07494f11f7c7f163f296c74894d59b02bf5632bd07d"
+        },
+        {
+          "path": ".cursor/rules/math-divide.mdc",
+          "sha256": "sha256:45e6062293cd8259b29d93b8a3849845fd46b9941acf7278442cf2e362d05f3f"
+        },
+        {
+          "path": ".cursor/rules/math-multiply.mdc",
+          "sha256": "sha256:546de9629ee467db77888b5ae9743081b001c4b8bad29cee1cc2469e02e2b042"
+        },
+        {
+          "path": ".cursor/rules/math-subtract.mdc",
+          "sha256": "sha256:c878b57ac82d731fda0ecee94679d05f76479e2522a870c584d795d3125b0f69"
+        }
+      ],
+      "digest": "sha256:8dc98dfe892327137990ef008b8458c8aa38bab13bef78e2ae2f907135d6a8aa"
+    },
+    {
+      "client": "copilot",
+      "displayName": "GitHub Copilot",
+      "directory": "copilot",
+      "kind": "overlay",
+      "skillsDir": ".github/instructions",
+      "mcpConfig": {
+        "path": ".vscode/mcp.json",
+        "format": "vscode",
+        "verified": false
+      },
+      "install": "copy the contents of copilot/ into your project root",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": ".github/instructions/math-add.instructions.md"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": ".github/instructions/math-divide.instructions.md"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": ".github/instructions/math-multiply.instructions.md"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": ".github/instructions/math-subtract.instructions.md"
+        }
+      ],
+      "files": [
+        {
+          "path": ".github/instructions/math-add.instructions.md",
+          "sha256": "sha256:d08adcdd6007ca77c6d74266f0af57cb198f21101d175e3fe925fcf2fb40a50a"
+        },
+        {
+          "path": ".github/instructions/math-divide.instructions.md",
+          "sha256": "sha256:c7bdb9b7bb4d6b9cf916f69619ea9282f590dad2f2b87d453d34e09d6467e808"
+        },
+        {
+          "path": ".github/instructions/math-multiply.instructions.md",
+          "sha256": "sha256:b6b3146a50a930f56bf61691d1c70f09ba32f4a31a93bb95a9f3c48af3142e46"
+        },
+        {
+          "path": ".github/instructions/math-subtract.instructions.md",
+          "sha256": "sha256:c2720e3fa900bbdd42d8f27d6d62f94547201756d5d1c9f4c437e5a037c4d051"
+        },
+        {
+          "path": ".vscode/mcp.json",
+          "sha256": "sha256:11063807267f8c4c071ea74361f426679aa2ec2706ee0f2f88d1cb0f6a35f51f"
+        }
+      ],
+      "digest": "sha256:b1a8810f4279b5357c3f4e2917b6e0575d30813df263505528112cb5a11fe4bb"
+    },
+    {
+      "client": "windsurf",
+      "displayName": "Windsurf",
+      "directory": "windsurf",
+      "kind": "overlay",
+      "skillsDir": ".windsurf/rules",
+      "mcpConfig": {
+        "path": ".windsurf/mcp_config.json",
+        "format": "mcpServers",
+        "verified": false
+      },
+      "install": "copy the contents of windsurf/ into your project root",
+      "skills": [
+        {
+          "name": "math-add",
+          "category": "core",
+          "description": "Add two or more numbers and report the sum together with its operands.",
+          "path": ".windsurf/rules/math-add.md"
+        },
+        {
+          "name": "math-divide",
+          "category": "core",
+          "description": "Divide numbers and report the quotient, refusing division by zero.",
+          "path": ".windsurf/rules/math-divide.md"
+        },
+        {
+          "name": "math-multiply",
+          "category": "core",
+          "description": "Multiply numbers and report the product, flagging any loss of precision.",
+          "path": ".windsurf/rules/math-multiply.md"
+        },
+        {
+          "name": "math-subtract",
+          "category": "core",
+          "description": "Subtract numbers and report the difference, stating which operand came first.",
+          "path": ".windsurf/rules/math-subtract.md"
+        }
+      ],
+      "files": [
+        {
+          "path": ".windsurf/mcp_config.json",
+          "sha256": "sha256:2ce5d509c352329559d607e6b87fa44af483df06c285fa60a68789aab2a7c093"
+        },
+        {
+          "path": ".windsurf/rules/math-add.md",
+          "sha256": "sha256:7c5a17a43f197f1abe62478f01438d51e6d5d6245d143e49c92487f00bc35262"
+        },
+        {
+          "path": ".windsurf/rules/math-divide.md",
+          "sha256": "sha256:f3e6c4a8b5c2727646c4bc119a6ed023792a01345b20b908e1d4de166364997e"
+        },
+        {
+          "path": ".windsurf/rules/math-multiply.md",
+          "sha256": "sha256:17183a391969a9e13703ea577878f6400711d453aa2e7dbe84813a5ce83c92a9"
+        },
+        {
+          "path": ".windsurf/rules/math-subtract.md",
+          "sha256": "sha256:10d1a8f82a99107f606b3c5550c89420c0e753add77843585fdcf650ee2c0608"
+        }
+      ],
+      "digest": "sha256:91a451f8eb5debe5eb05ca898fd589f0e9847c8319bcd8bccff54366a68843b0"
+    }
+  ]
+}
