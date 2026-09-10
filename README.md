@@ -11,6 +11,17 @@ nothing to set. It only works against that server — regenerate for anywhere el
 
 ## Install
 
+### Everything at once, as a marketplace
+
+```bash
+claude plugin marketplace add .
+claude plugin install pivotly
+```
+
+Run that from this directory. It lists: `pivotly`.
+
+### Or one client at a time
+
 ### Claude Code plugin — `claude/`
 
 ```bash

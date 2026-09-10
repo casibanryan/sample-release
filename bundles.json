@@ -33,6 +33,13 @@
       "description": "Subtract numbers and report the difference, stating which operand came first."
     }
   ],
+  "marketplace": {
+    "path": ".claude-plugin/marketplace.json",
+    "name": "pivotly",
+    "plugins": [
+      "pivotly"
+    ]
+  },
   "packages": [
     {
       "client": "claude",

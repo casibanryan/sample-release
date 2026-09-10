@@ -1,0 +1,18 @@
+{
+  "name": "pivotly",
+  "owner": {
+    "name": "Pivotly"
+  },
+  "metadata": {
+    "description": "Pivotly skills and MCP server for Claude Code.",
+    "version": "0.0.0"
+  },
+  "plugins": [
+    {
+      "name": "pivotly",
+      "source": "./claude",
+      "description": "Pivotly skills and MCP server: basic mathematics, plus the tools the Pivotly MCP server exposes.",
+      "version": "0.0.0"
+    }
+  ]
+}
