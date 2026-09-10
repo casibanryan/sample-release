@@ -2,6 +2,7 @@
   "name": "pivotly",
   "version": "0.0.0",
   "description": "Pivotly skills and MCP server: basic mathematics, plus the Pivotly tools.",
+  "contextFileName": "GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
       "httpUrl": "http://localhost:8080/mcp"

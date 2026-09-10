@@ -1,0 +1,32 @@
+description = "Multiply numbers and report the product, flagging any loss of precision."
+prompt = '''
+# Multiply
+
+Multiply numbers and be explicit when the product stops being exact.
+
+## When to use
+
+- The request asks for a product, a scaled value, an area, or a repeated total.
+- A unit price has to be applied to a quantity.
+
+## Instructions
+
+1. Multiply left to right. A single zero operand makes the entire product zero.
+2. Track the sign separately: an odd count of negative operands gives a negative product.
+3. Above 2^53 - 1 (`Number.MAX_SAFE_INTEGER`), say the result is approximate or switch to
+   exact integer arithmetic.
+4. Report the operands and the product together.
+
+## Examples
+
+- `6 * 7` = 42
+- `-3 * 4` = -12
+- `2.5 * 4` = 10
+
+## Pitfalls
+
+- **Magnitude.** Products cross `Number.MAX_SAFE_INTEGER` far sooner than people expect,
+  and past it every digit reported is a guess that still looks like an exact integer.
+- **Percent and scale.** "Increase by 20%" is `* 1.2`, not `* 0.2`. Say which factor was
+  applied.
+'''
