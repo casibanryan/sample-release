@@ -1,0 +1,85 @@
+---
+name: hello-world
+description: Confirm the Pivotly plugin is installed and report its status — version, last updated date, loaded skills, and server connection.
+category: core
+---
+
+# Hello World
+
+First contact with the Pivotly plugin. Says hello, then reports what is actually running.
+
+## When to use
+
+- Someone asks whether the Pivotly plugin is installed, working, or connected.
+- Someone asks which version this is, when it was last updated, or which skills it has.
+- Right after generating or installing a client package, to verify the install took.
+- A tool call failed and it is not yet clear whether the plugin, the server, or the
+  contract between them is at fault.
+
+## Instructions
+
+1. Greet once, name the plugin, then report status. A bare "Hello!" answers nothing that
+   the person could not already see.
+2. Read every field from its source at the moment of the report. A version quoted from
+   earlier in the conversation is a guess about the present.
+
+   | Field | Where it comes from |
+   | --- | --- |
+   | Name and version | `version` in the plugin package's `package.json` |
+   | Last updated | `git log -1 --date=short --format='%cd %h %s'` over the plugin directory |
+   | Protocol version | `PivotlyPlugin.protocolVersion` — always the contract's copy |
+   | Skills | `loadCoreSkills()` and `loadCustomSkills()`, or the directories under `skills/library/<category>/` |
+   | Server | `serverUrl` and `authMode` from the resolved `PluginConfig` |
+   | Connection | `await plugin.ping()`, then `await plugin.assertContractMatch()` |
+
+3. Separate what is on disk from what is live. The first four fields are true of an
+   install that has never reached a server; the last two are claims about a running one.
+4. Report the connection only if it was attempted this session. "Not attempted" is a real
+   answer and a useful one — it tells the reader which half is still unverified.
+5. Say what is missing rather than omitting the row. A field with no source found is
+   "unknown", not absent.
+6. Keep it to one block. Status is read at a glance, and prose hides the one line that
+   changed.
+
+## Examples
+
+A full report, every field resolved:
+
+```
+Pivotly plugin  0.0.0 (placeholder — package is private and unreleased)
+Last updated    2026-09-14  9b08550  Initial setup
+Protocol        <PivotlyPlugin.protocolVersion>
+Skills          1 core (hello-world), 0 custom
+Server          https://<your-deployment>/mcp, bearer auth
+Connection      ok — ping answered, contract matches
+```
+
+Installed but never connected, which is the common case right after generating a package:
+
+```
+Pivotly plugin  0.0.0 (placeholder — package is private and unreleased)
+Last updated    2026-09-14  9b08550  Initial setup
+Skills          1 core (hello-world), 0 custom
+Server          PIVOTLY_MCP_URL is not set
+Connection      not attempted — nothing to connect to yet
+```
+
+One line, when that is all that was asked: "Hello — Pivotly plugin 0.0.0, last updated
+2026-09-14, 1 core skill. Not connected to a server this session."
+
+## Pitfalls
+
+- **A file timestamp is not an update date.** `mtime` is rewritten by a clone, a checkout,
+  or a build, so it reports the day the machine touched the file rather than the day the
+  plugin changed. Use the commit date. Outside a git checkout the honest answer is
+  "unknown" — an mtime dressed up as a release date is worse than no date.
+- **`0.0.0` is a placeholder, not a release.** The package is `private` and pinned there.
+  Reporting it as a version implies a release that was never cut; say it is unreleased.
+- **The plugin's version is not the server's.** They deploy independently, so a host can
+  run a build compiled against a newer contract than the server it points at. That
+  mismatch is exactly what `assertContractMatch()` names, and a status report that lists
+  one version invites the reader to assume both sides are on it.
+- **Installed is not connected.** A generated package on disk proves the files were
+  written and nothing else. Only a ping proves a server answered.
+- **Never print the token.** `serverUrl` and `authMode` belong in a status report;
+  `PIVOTLY_MCP_TOKEN` does not, and a status block is pasted into issues.

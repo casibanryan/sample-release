@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:5a65fb665660
+@pivotly/plugin 0.0.0 · sha256:c880c2a813e1
 
 Pinned to http://localhost:8080/mcp — nothing to set.
 
@@ -17,7 +17,7 @@ claude plugin marketplace add . && claude plugin install pivotly
 **Gemini CLI extension**
 
 ```bash
-gemini extensions install ./gemini
+gemini extensions install .
 ```
 
 **OpenAI Codex**
@@ -54,4 +54,4 @@ nothing reports an error.
 - GitHub Copilot — copilot/.vscode/mcp.json
 - Windsurf — windsurf/.windsurf/mcp_config.json
 
-Skills: greeting, math-add, math-divide, math-multiply, math-subtract
+Skills: hello-world
