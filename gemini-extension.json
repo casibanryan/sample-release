@@ -1,7 +1,7 @@
 {
   "name": "pivotly",
   "version": "0.0.0",
-  "description": "Pivotly skills and MCP server: basic mathematics, plus the Pivotly tools.",
+  "description": "Pivotly skills and MCP server: the Pivotly skill library, plus the Pivotly tools.",
   "contextFileName": "./gemini/GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
