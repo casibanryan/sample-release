@@ -1,6 +1,7 @@
 ---
+name: hello-world
 description: Confirm the Pivotly plugin is installed and report its status — version, last updated date, loaded skills, and server connection.
-alwaysApply: false
+category: core
 ---
 
 # Hello World

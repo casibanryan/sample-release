@@ -55,4 +55,12 @@ First contact with the Pivotly plugin. Says hello, then reports what is actually
   written and nothing else. Only a ping proves a server answered.
 - **Never print the token.** `serverUrl` and `authMode` belong in a status report;
   `PIVOTLY_MCP_TOKEN` does not, and a status block is pasted into issues.
+
+---
+
+## Reference: TEST.md
+
+##TEST
+
+just testing if this file will be copied or not in the dis
 '''
