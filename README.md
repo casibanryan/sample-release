@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:cabb67d10c76
+@pivotly/plugin 0.0.0 · sha256:458868f8adb2
 
 Pinned to http://localhost:8080/mcp — nothing to set.
 

@@ -36,4 +36,23 @@ First contact with the Pivotly plugin. Says hello, then reports what is actually
    "unknown", not absent.
 6. Keep it to one block. Status is read at a glance, and prose hides the one line that
    changed.
+
+
+
+## Pitfalls
+
+- **A file timestamp is not an update date.** `mtime` is rewritten by a clone, a checkout,
+  or a build, so it reports the day the machine touched the file rather than the day the
+  plugin changed. Use the commit date. Outside a git checkout the honest answer is
+  "unknown" — an mtime dressed up as a release date is worse than no date.
+- **`0.0.0` is a placeholder, not a release.** The package is `private` and pinned there.
+  Reporting it as a version implies a release that was never cut; say it is unreleased.
+- **The plugin's version is not the server's.** They deploy independently, so a host can
+  run a build compiled against a newer contract than the server it points at. That
+  mismatch is exactly what `assertContractMatch()` names, and a status report that lists
+  one version invites the reader to assume both sides are on it.
+- **Installed is not connected.** A generated package on disk proves the files were
+  written and nothing else. Only a ping proves a server answered.
+- **Never print the token.** `serverUrl` and `authMode` belong in a status report;
+  `PIVOTLY_MCP_TOKEN` does not, and a status block is pasted into issues.
 '''
