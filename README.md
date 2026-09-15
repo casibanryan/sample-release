@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:453b06f1b0a3
+@pivotly/plugin 0.0.0 · sha256:3e93a891e7f5
 
 Pinned to http://localhost:8080/mcp — nothing to set.
 
@@ -32,10 +32,10 @@ cp -r codex/. /path/to/project/
 cp -r cursor/. /path/to/project/
 ```
 
-**GitHub Copilot**
+**GitHub Copilot plugin**
 
 ```bash
-cp -r copilot/. /path/to/project/
+copilot plugin marketplace add . && copilot plugin install pivotly@pivotly
 ```
 
 **Windsurf**
@@ -51,7 +51,7 @@ wrong the client ignores the file: the skills work, the tools never appear, and
 nothing reports an error.
 
 - OpenAI Codex — codex/.codex/config.toml
-- GitHub Copilot — copilot/.vscode/mcp.json
+- GitHub Copilot plugin — copilot/mcp.json
 - Windsurf — windsurf/.windsurf/mcp_config.json
 
 Skills: hello-world
