@@ -1,12 +1,10 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:49cbe9c87406
+@pivotly/plugin 0.0.0 · sha256:0794d8fdba60
 
-Set first:
+Pinned to http://localhost:8080/mcp — nothing to set.
 
-```bash
-export PIVOTLY_MCP_TOKEN=<your-token>
-```
+**This build has a bearer token baked into its configs.** Treat the whole directory as a secret — do not commit or publish it — and rebuild when the token expires.
 
 ## Install
 
