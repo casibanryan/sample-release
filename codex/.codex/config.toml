@@ -1,3 +1,6 @@
 [mcp_servers.pivotly-mcp-server]
 type = "http"
-url = "http://localhost:8080/mcp"
+url = "${PIVOTLY_MCP_URL}"
+
+[mcp_servers.pivotly-mcp-server.headers]
+Authorization = "Bearer ${PIVOTLY_MCP_TOKEN}"

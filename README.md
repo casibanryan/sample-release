@@ -1,10 +1,13 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:3e93a891e7f5
+@pivotly/plugin 0.0.0 · sha256:e068e3fe337d
 
-Pinned to http://localhost:8080/mcp — nothing to set.
+Set first:
 
-This build sends no credential — it targets a server with auth disabled.
+```bash
+export PIVOTLY_MCP_URL=https://<your-deployment>/mcp
+export PIVOTLY_MCP_TOKEN=<your-token>
+```
 
 ## Install
 

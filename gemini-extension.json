@@ -5,7 +5,10 @@
   "contextFileName": "./gemini/GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
-      "httpUrl": "http://localhost:8080/mcp"
+      "httpUrl": "${PIVOTLY_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${PIVOTLY_MCP_TOKEN}"
+      }
     }
   }
 }
