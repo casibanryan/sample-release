@@ -2,10 +2,7 @@
   "mcpServers": {
     "pivotly-mcp-server": {
       "type": "http",
-      "url": "${PIVOTLY_MCP_URL}",
-      "headers": {
-        "Authorization": "Bearer ${PIVOTLY_MCP_TOKEN}"
-      }
+      "url": "${PIVOTLY_MCP_URL}"
     }
   }
 }
