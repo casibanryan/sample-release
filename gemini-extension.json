@@ -5,7 +5,7 @@
   "contextFileName": "./gemini/GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
-      "httpUrl": "${PIVOTLY_MCP_URL}"
+      "httpUrl": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp"
     }
   }
 }

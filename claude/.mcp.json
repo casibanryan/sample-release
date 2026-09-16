@@ -2,7 +2,7 @@
   "mcpServers": {
     "pivotly-mcp-server": {
       "type": "http",
-      "url": "${PIVOTLY_MCP_URL}"
+      "url": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp"
     }
   }
 }
