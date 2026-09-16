@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:e068e3fe337d
+@pivotly/plugin 0.0.0 · sha256:8c1d230dd6ec
 
 Set first:
 
