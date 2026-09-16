@@ -1,8 +1,8 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:0794d8fdba60
+@pivotly/plugin 0.0.0 · sha256:c2700aab76d4
 
-Pinned to http://localhost:8080/mcp — nothing to set.
+Pinned to https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp — nothing to set.
 
 **This build has a bearer token baked into its configs.** Treat the whole directory as a secret — do not commit or publish it — and rebuild when the token expires.
 
