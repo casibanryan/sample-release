@@ -1,10 +1,12 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:80b5a9aaed37
+@pivotly/plugin 0.0.0 · sha256:49cbe9c87406
 
-Pinned to https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp — nothing to set.
+Set first:
 
-This build sends no credential — it targets a server with auth disabled.
+```bash
+export PIVOTLY_MCP_TOKEN=<your-token>
+```
 
 ## Install
 

@@ -5,7 +5,10 @@
   "contextFileName": "./gemini/GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
-      "httpUrl": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp"
+      "httpUrl": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp",
+      "headers": {
+        "Authorization": "Bearer ${PIVOTLY_MCP_TOKEN}"
+      }
     }
   }
 }

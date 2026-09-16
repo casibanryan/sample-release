@@ -1,3 +1,6 @@
 [mcp_servers.pivotly-mcp-server]
 type = "http"
 url = "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp"
+
+[mcp_servers.pivotly-mcp-server.headers]
+Authorization = "Bearer ${PIVOTLY_MCP_TOKEN}"
