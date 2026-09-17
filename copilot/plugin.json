@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "pivotly",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Pivotly skills and MCP server: the Pivotly skill library, plus the tools the Pivotly MCP server exposes.",
   "author": {
     "name": "Pivotly"
