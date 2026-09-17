@@ -4,7 +4,7 @@
     "name": "Pivotly"
   },
   "metadata": {
-    "description": "Pivotly skills and MCP server for Claude Code.",
+    "description": "Pivotly skills and MCP server for Claude Code and Cowork.",
     "version": "0.0.0"
   },
   "plugins": [

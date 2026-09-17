@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:c2700aab76d4
+@pivotly/plugin 0.0.0 · sha256:76187c1066cb
 
 Pinned to https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp — nothing to set.
 
@@ -8,7 +8,7 @@ Pinned to https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp — 
 
 ## Install
 
-**Claude Code plugin**
+**Claude Code / Cowork plugin**
 
 ```bash
 claude plugin marketplace add . && claude plugin install pivotly
@@ -43,6 +43,10 @@ copilot plugin marketplace add . && copilot plugin install pivotly@pivotly
 ```bash
 cp -r windsurf/. /path/to/project/
 ```
+
+**Cowork (Claude Desktop)**
+
+Under **Customize → Plugins**, choose **Add marketplace** and enter this repository's GitHub URL, then install `pivotly` from it. Plugins are not used in Chat.
 
 ## Unverified config paths
 
