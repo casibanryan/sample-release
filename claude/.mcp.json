@@ -1,11 +1,9 @@
-{
-  "mcpServers": {
-    "pivotly-mcp-server": {
-      "type": "http",
-      "url": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp",
-      "headers": {
-        "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6IlQ1aDQwcTdHMHg0OXFuNDFsTTkta0tqcEQ5OCJ9.eyJhdWQiOiIzMDQzZTlkMy0yOGU2LTQwMDItYWIzMS1jMDdmY2Y0MTgyMDUiLCJpc3MiOiJodHRwczovL2xvZ2luLm1pY3Jvc29mdG9ubGluZS5jb20vMzlmNmNmNWUtNzI1ZC00MDg3LWExZTMtZTdiNDQ0MmM4NjdlL3YyLjAiLCJpYXQiOjE3ODk2NjY2OTUsIm5iZiI6MTc4OTY2NjY5NSwiZXhwIjoxNzg5NjcxNjUwLCJhaW8iOiJBWlFBYS84ZUFBQUFKdmx1RERaYjE3WXpFQXlDVE9OVmUwMTRnc2diaThsZ1UrWnZHTWpCNHZTVzdDOVU2K0FzRTBVTkdqSDgvZTk2MTNYZWNnSWg3aDdYK1kzSUdKQzVvUkRBYWhiUVNvUVNFTVR1eGVWcFVCYWo1YW1nVWZWMWlJUVEwbFJNNGNzUmUvLzlzdVIvcmhvaVhBYURUNkMvU05WdHJSNmZrYklkRXY2bjBrc0grK0swNWVRUndKbi90WWZTcVBoeHdleTYiLCJhenAiOiIzMDQzZTlkMy0yOGU2LTQwMDItYWIzMS1jMDdmY2Y0MTgyMDUiLCJhenBhY3IiOiIwIiwiaWRwIjoiaHR0cHM6Ly9zdHMud2luZG93cy5uZXQvZGVlZWJjYTYtZDZmNS00MTY0LWE0ZDEtOTgwNDJiYjJiMmY0LyIsIm5hbWUiOiJSZXN0eSBPY2hlYSIsIm9pZCI6ImVkYzNiNzZmLTY0M2MtNDE0NC05MDhhLTkzZDNiNmJlNDkzZCIsInByZWZlcnJlZF91c2VybmFtZSI6InJlc3R5Lm9jaGVhQHBpdm90bHkuY29tIiwicmgiOiIxLkFSNEFYc18yT1YxeWgwQ2g0LWUwUkN5R2Z0UHBRekRtS0FKQXF6SEFmODlCZ2dVQUFHQWVBQS4iLCJzY3AiOiJhcGkucmVhZCIsInNpZCI6IjAwNmVjZjRhLWZlZjAtMDI4Yi03ZTk4LWUyNzgzNGIxNDE5YyIsInN1YiI6IjFydm9aZzVITEdab1p1VzZLMHNIZkU1dnRkOUhaRmxtaVRfQnlBWWgwVFkiLCJ0aWQiOiIzOWY2Y2Y1ZS03MjVkLTQwODctYTFlMy1lN2I0NDQyYzg2N2UiLCJ1dGkiOiJiSmpsTklmb09rdUlKUENaLWVIUEFBIiwidmVyIjoiMi4wIiwieG1zX2Z0ZCI6InFHNkpyamJSMDdsbVNyalptaVZEal9GTnU2UXVYdEpaRTJGa2VoaThMZ3dCZFhOemIzVjBhQzFrYzIxeiJ9.U3gJtE3QND6h4rh3BwnjU7A_POZPz7B63JI1j9azkafPgI6iXphVJCYAGCqgnkpUK-MRuCsiJJJ7ZKKWy_8Tnec-cnVEqYnDwMOrlPmAuU7vZTi010-tJ9q1tAG2jgFNDWl5silGyYKS9JclUiZIiuvd0AIsr-AbVJmKYMXf7R2ZI2vgDQDvs53G91y3y2MBB8l_82rvhG8ayOmLPnoOvoWtQLtuyo8ikT5TOSa8SXwUjBikuc9sLBp9lZjCRXdcwM3K0zubxZ7Rz_BRUGNwT-5MgBSoiutXpMWQrLZW0M2DgrmIzkmyJfpck6X_gW2zEHP952Z4El-zoODSeQqsgA"
-      }
+{ "mcpServers": { "pivotly-mcp-server": {
+    "type": "http",
+    "url": "https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp",
+    "oauth": {
+      "clientId": "39f6cf5e-725d-4087-a1e3-e7b4442c867e",
+      "authServerMetadataUrl": "https://login.microsoftonline.com/39f6cf5e-725d-4087-a1e3-e7b4442c867e/v2.0/.well-known/openid-configuration",
+      "scopes": "api://3043e9d3-28e6-4002-ab31-c07fcf418205/api.read"
     }
-  }
-}
+} } }
