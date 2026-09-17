@@ -1,6 +1,6 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:36be61ab0dc4
+@pivotly/plugin 0.0.3 · sha256:08a2bd1e15ac
 
 Pinned to https://app-platform-dev-mcp-server-cus-001.azurewebsites.net/mcp — nothing to set.
 
