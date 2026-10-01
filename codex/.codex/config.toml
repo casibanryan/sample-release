@@ -1,6 +1,3 @@
 [mcp_servers.pivotly-mcp-server]
 type = "http"
-url = "http://localhost:8080/mcp"
-
-[mcp_servers.pivotly-mcp-server.headers]
-Authorization = "Bearer ${PIVOTLY_MCP_TOKEN}"
+url = "https://app-sbx-mcp-authtest-cus-001.azurewebsites.net/mcp"

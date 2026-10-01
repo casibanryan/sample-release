@@ -5,10 +5,7 @@
   "contextFileName": "./gemini/GEMINI.md",
   "mcpServers": {
     "pivotly-mcp-server": {
-      "httpUrl": "http://localhost:8080/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PIVOTLY_MCP_TOKEN}"
-      }
+      "httpUrl": "https://app-sbx-mcp-authtest-cus-001.azurewebsites.net/mcp"
     }
   }
 }

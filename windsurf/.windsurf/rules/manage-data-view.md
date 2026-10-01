@@ -1,0 +1,2106 @@
+---
+name: manage-data-view
+description: Author, publish, inspect and execute Pivotly data views (governed, versioned, read-only parameterized SQL queries managed as config items) in direct_sql mode through the Pivotly MCP tool config-item_data-view, with careful handling of ${p_...} parameter references. Use it whenever someone mentions a Pivotly data view, a data_view config item, or a parameterized query over usdf tables, or says things like 'create a data view', 'write a view that returns active clients by region', 'add a parameter to the view', 'make region optional', 'my parameter isn't being substituted', 'do I need ${} around the parameter', 'the view ignores p_region', 'INVALID_PARAMETER_NAME_PREFIX', 'publish the data view', 'run the view for APAC', 'execute active-clients', 'what parameters does this view take', 'show me the view definition', 'which views are published', 'publication history', 'unpublish the view', 'delete the data view', 'my view says publish it first', 'rejected for usdf clients_b' - even when Pivotly isn't named.
+category: core
+---
+
+```skill
+category: core
+```
+
+# Manage Pivotly Data Views (direct SQL)
+
+## Safety / confirmation policy
+
+Applies to every call in this skill, not only inside the workflows.
+
+| Operation(s)                                                                                                        | Class                                  | Rule                                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get`, `get_by_slug`, `list`, `filter`, `list_published`, `publications_for_view`, `get_definition`; `pivotly_ping` | read-only                              | Call freely; answer questions from these before touching anything.                                                                                                         |
+| `execute`                                                                                                           | runs a read-only query                 | No confirmation needed, but confirm the parameter values when you had to infer any of them. Never execute a view to "test" it with values the user didn't give or approve. |
+| `create`, `update`                                                                                                  | ⚠️ writes configuration                | Show the exact `slug`, `direct_sql` and `parameters[]` you will send and get an explicit yes first. Saving does not change the runnable view.                              |
+| `publish`                                                                                                           | ⚠️ builds / replaces the runnable view | Confirm the slug and that the latest **saved** manifest is what they want live.                                                                                            |
+| `unpublish`                                                                                                         | ⚠️ drops the runnable view             | Confirm the slug; after this, `execute` returns 404 until re-published. The config item remains.                                                                           |
+| `delete_config_item`                                                                                                | ⚠️ soft-deletes the config item        | Confirm slug and id. Does **not** drop a published view function — that is `unpublish`. When the user says "delete the view", ask which they mean.                         |
+
+Never guess a slug, id, or parameter name — look it up (`get_by_slug`, `list`, `get_definition`). Never retry a mutating call on a 5xx without reading `message` first (ordinary rejections arrive as 5xx — see Pitfalls).
+
+**Never splice user-supplied values into `direct_sql`.** Every value that varies per run (a region, a date, an id) becomes a declared parameter referenced as `${p_<name>}` and is passed at `execute`. `direct_sql` holds only fixed query text.
+
+## Mental model
+
+A **data view** is a governed, versioned, **read-only parameterized query** over published data. You author it as a **config item** (`item_type` = `data_view`, identified by `slug` and a uuid `id`) whose `cfg_data` manifest carries the SQL (`direct_sql`) and the typed `parameters[]`.
+
+Lifecycle: **create → (update) → publish → execute**, then **unpublish** or soft-delete when retired. Create/update only store the manifest; **publish is where the query and parameters are validated** and compiled into a runnable view function. Only a view with a `status=complete`, `implementation=function` publication can be executed.
+
+**Parameter references:** a parameter declared as `{ "name": "p_region" }` is referenced in `direct_sql` as `${p_region}` and is passed to `execute` as `"parameters": { "p_region": "APAC" }`. The same exact name — `p_` prefix included — is used in all three places (wrapped in `${…}` only inside the SQL). Publish does not add the prefix for you.
+
+Identity by operation: config-item `id` (uuid) → `update`, `delete_config_item`, `get`; `slug` → everything else (`create`, `update`, `get_by_slug`, `publish`, `unpublish`, `publications_for_view`, `get_definition`, `execute`).
+
+Scope of this skill: `authoring_mode: "direct_sql"` only. `builder` mode exists (`builder.sources`) but is not covered — if asked, say so. The generic runtime view-query surface (`/v3/views/...`) is excluded by the doc (§13); use `execute`.
+
+## Prerequisites
+
+- The Pivotly MCP server is connected and authorized. Every underlying REST call carries `Authorization: Bearer <access_token>`; the server supplies it. Never ask the user for a token and never put one in a call.
+- Permissions are `data_view.<action>`: `list`, `view`, `create`, `change` (update **and** unpublish), `delete`, `publish`, `run`. A missing permission returns **403** — report it, don't retry.
+- Pre-flight once per session: call `pivotly_ping` before the first `config-item_data-view` call. If it fails, stop and tell the user the server is unreachable or not authorized.
+- Reference the tools exactly as the server lists them: `config-item_data-view` and `pivotly_ping`. Clients that namespace tools add their own prefix.
+- The SQL must read from a **published domain's** filtered read view, `usdf.<domain>` (e.g. `usdf.clients`). To learn which domains and columns exist, use the domain tooling (`config-item_domain`, e.g. the manage-domain skill) — never guess column names.
+- The REST doc's optional `X-Tenant-Id` header (on authoring writes) has no tool parameter — tenant context, if any, is the server's configuration (not documented).
+- Never send: `id` on `create` (→ 400); `item_type` / `itemType` (not tool properties — the schema has `additionalProperties: false`, so unknown keys are rejected). The REST create/update body requires `data.item_type` = `data_view`; the tool has no property for it, so it is expected to supply it itself (not documented) — if a `create` / `update` returns a 400 naming `item_type`, report it rather than adding the key.
+
+## Pivotly MCP → `pivotly_ping`
+
+- **Purpose:** liveness probe — echoes a message and reports protocol version and server build.
+- **Side effects:** none (read-only per its description; the snapshot has no `annotations`).
+- **Inputs:** `message` (string, `maxLength` 500, optional).
+- **Output:** not documented beyond the description. Nothing chains from it.
+- **Errors → next action:** any failure → stop, report, do not proceed.
+- **Example:** `{ "message": "manage-data-view preflight" }`
+
+## Pivotly MCP → `config-item_data-view`
+
+One tool, thirteen operations chosen by the required `operation` property. The schema has `additionalProperties: false` — send only the properties listed here.
+
+### Operation map
+
+| `operation`             | REST endpoint (doc §)                                  | permission          | side effects                |
+| ----------------------- | ------------------------------------------------------ | ------------------- | --------------------------- |
+| `create`                | `POST /v3/config-items/data_view` (§8.1)               | `data_view.create`  | ⚠️ creates the config item  |
+| `update`                | `PATCH /v3/config-items/data_view/{id}` (§8.2)         | `data_view.change`  | ⚠️ new config-item version  |
+| `delete_config_item`    | `DELETE /v3/config-items/data_view/{id}` (§8.3)        | `data_view.delete`  | ⚠️ soft-delete              |
+| `get`                   | `GET /v3/config-items/data_view/{id}` (§8.4)           | `data_view.view`    | read                        |
+| `get_by_slug`           | `GET /v3/config-items/data_view/by-slug/{slug}` (§8.5) | `data_view.view`    | read                        |
+| `list`                  | `GET /v3/config-items/data_view` (§8.6)                | `data_view.list`    | read                        |
+| `filter`                | `GET /v3/config-items?itemType=data_view` (§8.7)       | `data_view.list`    | read                        |
+| `publish`               | `POST /v3/data-views/{slug}/publish` (§9.1)            | `data_view.publish` | ⚠️ builds the runnable view |
+| `unpublish`             | `DELETE /v3/data-views/{slug}/unpublish` (§9.2)        | `data_view.change`  | ⚠️ drops the runnable view  |
+| `list_published`        | `GET /v3/data-views/publications` (§9.3)               | `data_view.view`    | read                        |
+| `publications_for_view` | `GET /v3/data-views/{slug}/publications` (§9.4)        | `data_view.view`    | read                        |
+| `get_definition`        | `GET /v3/data-views/{slug}/definition` (§9.5)          | `data_view.view`    | read                        |
+| `execute`               | `POST /v3/data-views/{slug}/execute` (§10.1)           | `data_view.run`     | runs the read-only query    |
+
+### Inputs (mirrors the tool's `inputSchema`)
+
+| name                                               | type                                                     | used by                                                                                                                                                              | notes                                                                                                                                                          |
+| -------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `operation`                                        | string enum — the 13 values above                        | all                                                                                                                                                                  | **required** (the only schema-required property)                                                                                                               |
+| `id`                                               | string                                                   | `update`, `delete_config_item`, `get` (required); `filter` (optional)                                                                                                | config-item uuid                                                                                                                                               |
+| `slug`                                             | string                                                   | **required** for `create` **and** `update`, and for `get_by_slug`, `publish`, `unpublish`, `publications_for_view`, `get_definition`, `execute`; `filter` (optional) | must match `^[a-z][a-z0-9_-]{0,127}$` (malformed → 400 on `create`; `INVALID_SLUG` at publish)                                                                                                    |
+| `cfg_data`                                         | object                                                   | **required** for `create` **and** `update`                                                                                                                           | the manifest — see Shared mechanics                                                                                                                            |
+| `name`                                             | string                                                   | `create` / `update` (≤255); `filter`                                                                                                                                 |                                                                                                                                                                |
+| `description`                                      | string \| null                                           | `create` / `update` (≤1000); `filter`                                                                                                                                |                                                                                                                                                                |
+| `version`                                          | integer                                                  | `create` / `update`; `filter`                                                                                                                                        | config-item version                                                                                                                                            |
+| `enabled`                                          | boolean                                                  | `create` / `update` (default `true`); `filter`                                                                                                                       |                                                                                                                                                                |
+| `fetchType`                                        | `paginated` \| `list`                                    | `list`                                                                                                                                                               |                                                                                                                                                                |
+| `page`                                             | number                                                   | `list`, `list_published`, `publications_for_view` (zero-based, default 0); `filter` (≥1)                                                                             | base differs by operation                                                                                                                                      |
+| `pageSize`                                         | integer                                                  | `list` (1–100); `list_published`, `publications_for_view` (1–500, default 20)                                                                                        |                                                                                                                                                                |
+| `slugContains`                                     | string                                                   | `list`, `list_published`                                                                                                                                             | substring on slug                                                                                                                                              |
+| `search`                                           | string                                                   | `list`, `list_published`                                                                                                                                             | free text                                                                                                                                                      |
+| `sortModel`                                        | array of `{ field, sort }`                               | `list`, `list_published`, `publications_for_view`                                                                                                                    | `sort` ∈ `asc` \| `desc`; both keys required                                                                                                                   |
+| `filterModel`                                      | `{ items: [{ field, operator, value }], logicOperator }` | `list`, `list_published`, `publications_for_view`                                                                                                                    | `items`, `field`, `operator` required; `logicOperator` ∈ `and` \| `or`                                                                                         |
+| `fullPath`, `createdBy`, `modifiedBy`, `isDeleted` | string \| number \| boolean                              | `filter`                                                                                                                                                             |                                                                                                                                                                |
+| `limit`                                            | number                                                   | `filter`                                                                                                                                                             | ≤100                                                                                                                                                           |
+| `parameters`                                       | object (name → value)                                    | `execute` only                                                                                                                                                       | keys **including** the `p_` prefix, matching `^[a-z][a-z0-9_]*$`; take names from `get_definition`. Not the same thing as `cfg_data.parameters` (see Pitfalls) |
+
+**Result shape (all operations):** the snapshot has no `outputSchema`, so the REST envelope (Shared mechanics) is the guide — read the result before chaining a value. How the tool delivers a failure (an `isError` result vs the envelope with `error: true`) is not documented — surface `message` (and `details` when present) and ask before retrying.
+
+### `create`
+
+- **Purpose:** create a new data-view config item.
+- **Side effects:** ⚠️ writes configuration. Confirm the payload first. Nothing is runnable until `publish`.
+- **Inputs:** `slug`, `cfg_data` (required); optional `name`, `description`, `enabled`, `version`. Never `id`.
+- **Output (201):** `data: { id, slug, version }` — keep `data.id` for `update` / `delete_config_item` / `get`.
+- **Errors → next action:** 400 (missing/malformed `slug` — it must match the slug format — or `cfg_data`, `item_type` mismatch, id on create) → fix and resend; 403 → stop; 5xx duplicate slug → `get_by_slug`, then offer ⚠️ `update` or another slug. Manifest problems usually surface later, at `publish`.
+- **Example:**
+
+```json
+{
+  "operation": "create",
+  "slug": "active-clients",
+  "name": "Active Clients",
+  "cfg_data": {
+    "authoring_mode": "direct_sql",
+    "implementation": "function",
+    "direct_sql": "SELECT id, name FROM usdf.clients WHERE region = ${p_region}",
+    "parameters": [{ "name": "p_region", "type": "text", "required": true }]
+  }
+}
+```
+
+→ `201` · `data: { "id": "…", "slug": "active-clients", "version": 1 }`
+
+### `update`
+
+- **Purpose:** change an existing manifest (SQL, parameters, name). Does **not** republish.
+- **Side effects:** ⚠️ writes configuration; the runnable view is unchanged until the next `publish`. Confirm the diff.
+- **Inputs:** `id`, `slug`, `cfg_data` (all required by the tool — send the **complete** `cfg_data`, a convention of this skill since the doc states merge semantics but not whether the merge descends into `cfg_data`); optional `name`, `description`, `enabled`.
+- **Output (200):** `data: { id, slug, version }`, version incremented.
+- **Errors:** 400 (body id ≠ path id, item-type mismatch); 403; 404 (id not found → look it up again); 5xx platform-state → read `message`.
+- **Example:** `{ "operation": "update", "id": "…", "slug": "active-clients", "cfg_data": { "...": "the complete manifest" } }`
+
+### `delete_config_item`
+
+- **Purpose:** soft-delete the config item. **Side effects:** ⚠️ does not drop a published view function — `unpublish` first if it should stop running.
+- **Inputs:** `id`. **Output (200):** `data: { id, slug, version }`. **Errors:** 403, 404.
+- **Example:** `{ "operation": "delete_config_item", "id": "…" }`
+
+### `get` / `get_by_slug`
+
+- **Purpose:** fetch the full config item by `id` or `slug`. **Side effects:** none.
+- **Output (200):** **camelCase** response: `{ id, slug, itemType, version, name, enabled, cfgData }`. `id` feeds `update`; `cfgData` is the manifest to edit — send it back under the key `cfg_data`.
+- **Errors:** 403; 404 (in a create flow, 404 from `get_by_slug` means the slug is free).
+- **Example:** `{ "operation": "get_by_slug", "slug": "active-clients" }`
+
+### `list` / `filter`
+
+- **Purpose:** find data-view config items. **Side effects:** none.
+- **`list` inputs:** `fetchType`, `page` (zero-based), `pageSize` (1–100), `slugContains`, `search`, `sortModel`, `filterModel`. **Output:** `data` = config items + `pagination`.
+- **`filter` inputs:** at least one of `id`, `version`, `enabled`, `name`, `description`, `slug`, `fullPath`, `createdBy`, `modifiedBy`, `isDeleted`; paging `page` (≥1), `limit` (≤100). No filter → 400. The endpoint's `itemType=data_view` is supplied by the tool.
+- **Example:** `{ "operation": "list", "slugContains": "client", "sortModel": [{ "field": "slug", "sort": "asc" }] }`
+
+### `publish`
+
+- **Purpose:** validate the saved manifest and compile it into a runnable, parameterized view function. **This is the real validator** — run the pre-publish checklist (Shared mechanics) first.
+- **Side effects:** ⚠️ builds / replaces the runnable view. Confirm.
+- **Inputs:** `slug`. No body.
+- **Output (200):** `data: { slug, db_object_name, pub_id }` and a `message` like `Data view "active-clients" published as function …` — surface it.
+- **Errors → next action:** 404 `NOT_FOUND` → no config for that slug; check `list`. 403 → stop. 5xx with a code in `message` → see the error table in Shared mechanics; fix the manifest via ⚠️ `update`, then ⚠️ re-publish.
+- **Example:** `{ "operation": "publish", "slug": "active-clients" }`
+
+### `unpublish`
+
+- **Purpose:** drop the published view function; the config item stays.
+- **Side effects:** ⚠️ `execute` stops working until re-published. Confirm.
+- **Inputs:** `slug`. **Output (200):** `message: "Data view unpublished"`.
+- **Errors:** 403; 5xx `UNPUBLISH_FAILED` (report `message`), `MISSING_PARAM` (slug missing).
+- **Example:** `{ "operation": "unpublish", "slug": "active-clients" }`
+
+### `list_published` / `publications_for_view`
+
+- **Purpose:** what is live, and one view's publication history. **Side effects:** none.
+- **`list_published` output:** rows `{ view_slug, status, implementation, db_object_name, published_at, published_by, name, description }` + `pagination` (one row per slug: its latest complete function publication).
+- **`publications_for_view` output:** rows `{ id, view_slug, status, implementation, parameter_signature, db_object_name, published_at, published_by }` + `pagination`. `status: "complete"` = executable; other states are in-progress/failed (exact values not documented).
+- **Example:** `{ "operation": "publications_for_view", "slug": "active-clients", "sortModel": [{ "field": "published_at", "sort": "desc" }] }`
+
+### `get_definition`
+
+- **Purpose:** the publish-time snapshot — the **authoritative parameter names and types** to use at `execute`, plus output columns.
+- **Side effects:** none. **Inputs:** `slug`.
+- **Output (200):** `data: { db_object_name, parameter_signature, view_cfg: { parameters, columns } }`. `columns` may be an empty array — don't assume it is populated.
+- **Errors:** 404 (no published function → publish first); 403.
+- **Example:** `{ "operation": "get_definition", "slug": "active-clients" }`
+
+### `execute`
+
+- **Purpose:** run a published view with named parameters and return rows.
+- **Side effects:** none beyond running the read-only query.
+- **Inputs:** `slug`; `parameters` — object keyed by the exact names from `get_definition` (`p_` prefix included), values in their JSON types (`"APAC"`, `42`, `true`). Omit or `{}` for a view without parameters.
+- **Output (200):** `data` = array of result rows.
+- **Errors → next action:** 404 → no `status=complete`, `implementation=function` publication ("Publish the data view first.") → offer ⚠️ `publish`; 400 → a key is not a valid identifier (check spelling/prefix against `get_definition`); 403 → stop; 5xx → the query failed at run time; report `message` (often a value that doesn't fit the parameter's `type`).
+- **Example:** `{ "operation": "execute", "slug": "active-clients", "parameters": { "p_region": "APAC" } }` → `data: [{ "id": "…", "name": "…" }, …]`
+
+## Shared mechanics
+
+### Response envelope (doc §4)
+
+Success: `{ data, meta, status, error: false, message?, pagination? }`. Error: `{ data: null, meta: {}, status, error: true, message, details? }`. Branch on `error`, then `message` / `details`. `pagination` = `{ page, page_size, total_records }`.
+
+### Spelling layers
+
+Request properties are snake_case (`cfg_data`, `direct_sql`, `authoring_mode`), GET config-item responses are camelCase (`itemType`, `cfgData`), publication/definition responses are snake_case (`view_slug`, `db_object_name`, `parameter_signature`, `view_cfg`, `pub_id`). Query/filter tool properties are camelCase (`pageSize`, `slugContains`, `fullPath`, `isDeleted`). Copying `cfgData` from a GET into an update means sending it as `cfg_data`. In REST, `sortModel` / `filterModel` are JSON-encoded query strings; the tool takes the structured array / object.
+
+`filterModel.items[].operator` ∈ `contains`, `doesNotContain`, `equals`, `doesNotEqual`, `startsWith`, `endsWith`, `isEmpty`, `isNotEmpty`, `is`, `not`, `isAnyOf`, `=`, `!=`, `>`, `>=`, `<`, `<=`, `after`, `before`, `onOrAfter`, `onOrBefore`.
+
+### `cfg_data` — the direct-SQL manifest (doc §6)
+
+```jsonc
+{
+  "authoring_mode": "direct_sql", // "direct_sql" (default) | "builder" — this skill always sends "direct_sql"
+  "implementation": "function", // "function" (default, executable) | "view" (NOT executable via execute)
+  "direct_sql": "SELECT id, name FROM usdf.clients WHERE region = ${p_region}", // REQUIRED in direct_sql mode; read-only SELECT
+  // "builder": { "sources": [...] } — REQUIRED only in builder mode (out of scope)
+  "parameters": [
+    {
+      "name": "p_region", // REQUIRED; ^p_[a-z][a-z0-9_]*$ — p_ prefix mandatory, stored verbatim
+      "type": "text", // text (default) | integer | uuid | boolean | numeric | date | timestamptz; "data_type" accepted as alias key
+      "default": null, // optional
+      "required": false // optional boolean, default false
+    }
+  ],
+  "area": "sales", // optional; normalized on publish
+  "columns": [] // optional; output columns are introspected at publish
+}
+```
+
+Convention of this skill (not system defaults): always send `authoring_mode: "direct_sql"` and `implementation: "function"` explicitly, and always send `type` on every parameter (not `data_type`, and not both).
+
+### Parameter references — rules
+
+| #   | Rule                                                                                                                                                                                                                                                                                                  | Source                                             |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| 1   | Reference a parameter in `direct_sql` as `${p_<name>}` — the `parameters[].name`, character for character, inside `${` `}`: `${p_region}`. Not bare `p_region`, not `$p_region`, not `{p_region}`. | doc §6 |
+| 2   | Names match `^p_[a-z][a-z0-9_]*$`: lowercase, starts `p_` + a letter, then letters/digits/underscores. `region`, `p_Region`, `p-region`, `p_1st` are all wrong. The `${…}` wrapper belongs only in the SQL, never in `parameters[].name`. | doc §6/§7 |
+| 3   | Publish does **not** add the prefix. A parameter named `region` → `INVALID_PARAMETER_NAME_PREFIX`; a parameter with no `name` → `INVALID_CFG_DATA`.                                                                                                                                                   | doc §6/§11                                         |
+| 4   | At `execute`, pass the same key (`"p_region"`), taken from `get_definition` — never the name without its `p_` prefix.                                                                                                                                                                                 | doc §10.1                                          |
+| 5   | A reference stands where a **value** goes (as in `WHERE region = ${p_region}`). Don't wrap it in quotes (`'${p_region}'`) or concatenate it into strings. Use references for values only, never for table, column, or keyword names. | convention |
+| 6   | Every `${p_…}` reference in `direct_sql` has a matching `parameters[]` entry, and every declared parameter is used. No bare `p_…` name is left where a parameter was meant (a bare name is not the documented reference form). The doc does not say what publish does with a mismatch — check it yourself before publishing. | convention |
+| 7   | Pick `type` to match the column being compared (`integer` for integer ids, `uuid` for uuid ids, `date` / `timestamptz` for dates). Execute-time values arrive in their JSON types; the accepted string format for `date` / `timestamptz` is not documented — read `message` on the first 5xx.         | doc §6/§10.1                                       |
+| 8   | A non-required parameter with no `default` binds as `DEFAULT NULL`. In SQL, `col = NULL` matches no rows — for an optional filter write `(${p_region} IS NULL OR region = ${p_region})`. | doc §6 (NULL binding); SQL pattern is a convention |
+| 9   | A `${…}` expression `default` also binds as `DEFAULT NULL` for direct callers. Which expressions a default may contain is not documented — don't invent one; if the user wants one, store it as they give it, warn that callers may receive NULL, and write the SQL to tolerate NULL (rule 8). | doc §6 |
+| 10  | `required: true` means the caller must supply it; still pass every parameter explicitly at `execute` rather than relying on defaults.                                                                                                                                                                 | convention                                         |
+| 11  | Never put a user-supplied value directly into `direct_sql`; declare a parameter instead.                                                                                                                                                                                                              | safety policy                                      |
+
+### SQL rules (enforced at publish)
+
+- Read-only `SELECT` only — any DDL / non-SELECT keyword → `INVALID_SQL_DDL_KEYWORD`. If this fires on what you believe is a plain SELECT, look for a keyword-like word elsewhere in the text (an alias, a comment) — the doc doesn't say how the check scans.
+- Read from `usdf.<domain>` (the filtered read view, which applies access and system gating) — never `usdf.<domain>_b` (base) or `usdf.<domain>_c` (archive) → `INVALID_SQL_BASE_TABLE_REFERENCE`.
+- `direct_sql` non-empty; `authoring_mode` / `implementation` valid → else `INVALID_CFG_DATA`.
+- `slug` matches `^[a-z][a-z0-9_-]{0,127}$` → else 400 on `create`, `INVALID_SLUG` at publish.
+
+### Pre-publish checklist
+
+1. `authoring_mode: "direct_sql"`, `implementation: "function"` (unless the user explicitly wants a non-executable `view`).
+2. SQL is a single read-only `SELECT` over `usdf.<domain>` names only.
+3. Find every `${…}` reference in `direct_sql`; each is `${p_[a-z][a-z0-9_]*}` and its inner name appears in `parameters[].name`; no declared parameter is unused; no bare `p_…` name is left where a parameter was meant.
+4. Every parameter has a valid `type`; optional parameters are NULL-safe in the SQL.
+5. No literal user value is embedded in the SQL.
+
+### Error codes (doc §11)
+
+| Code / condition                   | HTTP | Where                    | Next action                                                                     |
+| ---------------------------------- | ---- | ------------------------ | ------------------------------------------------------------------------------- |
+| request validation                 | 400  | create / update / delete | fix the request shape (missing/mis-typed field, malformed slug, id on create, id/type mismatch)                                                           |
+| duplicate slug / platform-state    | 5xx  | create / update          | read `message`; `get_by_slug` → ⚠️ `update`, or new slug                        |
+| `NOT_FOUND`                        | 404  | publish                  | no config for slug; check `list`                                                |
+| `MISSING_PARAM`                    | 5xx  | publish, unpublish       | slug missing                                                                    |
+| `INVALID_SLUG`                     | 5xx  | publish                  | slug format                                                                     |
+| `INVALID_CFG_DATA`                 | 5xx  | publish                  | bad mode/implementation, empty `direct_sql`, missing parameter name, bad `type` |
+| `INVALID_PARAMETER_NAME_PREFIX`    | 5xx  | publish                  | rename to `p_…` in `parameters[]` **and** every `${…}` reference in `direct_sql`       |
+| `INVALID_SQL_DDL_KEYWORD`          | 5xx  | publish                  | make it a pure SELECT                                                           |
+| `INVALID_SQL_BASE_TABLE_REFERENCE` | 5xx  | publish                  | `usdf.<domain>_b` / `_c` → `usdf.<domain>`                                      |
+| `INVALID_FILTER_OP`                | 5xx  | publish                  | builder mode only — out of scope                                                |
+| `PUBLISH_FAILED`                   | 5xx  | publish                  | generic; report `message`, stop                                                 |
+| `UNPUBLISH_FAILED`                 | 5xx  | unpublish                | report `message`                                                                |
+| no published function              | 404  | execute, get_definition  | ⚠️ publish first                                                                |
+| invalid parameter key              | 400  | execute                  | key must match `^[a-z][a-z0-9_]*$`; use `get_definition` names                  |
+| execution failure                  | 5xx  | execute                  | read `message` (often a type mismatch)                                          |
+| not authorized                     | 403  | all                      | stop; missing `data_view.<action>`                                              |
+
+## Workflows
+
+### A. Create and publish a new data view
+
+1. `pivotly_ping` (once per session).
+2. `get_by_slug` with the intended slug — 404 = free; 200 = use Workflow B.
+3. Confirm the source domain and its columns (domain tooling); never guess them.
+4. Write `direct_sql` with a `${p_<name>}` reference for every per-run value; declare each in `parameters[]` with `type` and `required`. Run the pre-publish checklist.
+5. ⚠️ Show slug, SQL and parameters; on yes → `create`. Keep `data.id`.
+6. ⚠️ Confirm → `publish`. Surface `message`. On a 5xx code, fix via ⚠️ `update` (full `cfg_data`) and ⚠️ re-publish.
+7. `get_definition` → report the parameter signature and columns. Offer a first `execute` with values the user chooses.
+
+### B. Change an existing view (edit SQL, add/rename/make optional a parameter)
+
+1. `get_by_slug` → `id`, `slug`, `cfgData`.
+2. Edit a copy of `cfgData`. Renaming a parameter means changing `parameters[].name` **and** every `${p_…}` reference in `direct_sql` together. If the stored SQL still uses bare `p_…` names (older skill convention), convert them to `${p_…}` in the same edit and say so. Making one optional means `required: false` plus NULL-safe SQL (rule 8).
+3. Run the pre-publish checklist.
+4. ⚠️ Show the diff → `update` with `id`, `slug`, complete `cfg_data`.
+5. ⚠️ Confirm → `publish` (the old function keeps running until then). Tell the user that callers must use the new parameter names after a rename.
+
+### C. Run a view
+
+1. `get_definition` → exact names and types in `view_cfg.parameters` / `parameter_signature`.
+2. Map the user's words to those keys (e.g. "for APAC" → `p_region: "APAC"`); ask for any required value you don't have.
+3. `execute` with `slug` + `parameters`. On 404 → offer ⚠️ `publish`; on 400 → fix key spelling; on 5xx → report `message`.
+
+### D. Status questions
+
+What's live → `list_published`; history for one view → `publications_for_view` (newest first via `sortModel` on `published_at`); what it takes and returns → `get_definition`; stored manifest → `get_by_slug`.
+
+### E. Retire a view
+
+1. Ask which is meant: stop it running (`unpublish`), remove the config item (`delete_config_item`), or both.
+2. ⚠️ Confirm → `unpublish` with `slug`.
+3. ⚠️ Confirm → `delete_config_item` with `id` (from `get_by_slug`). Ordering is this skill's convention.
+
+## User phrasing → call
+
+| user says                                                                            | call                                                                |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| "create a data view that returns X by Y", "new parameterized query over clients"     | Workflow A → ⚠️ `create`                                            |
+| "add a region filter", "add a parameter", "make the date optional", "change the SQL" | Workflow B → `get_by_slug`, ⚠️ `update`, ⚠️ `publish`               |
+| "my parameter isn't substituted", "do I need ${}", "INVALID_PARAMETER_NAME_PREFIX" | check parameter-reference rules 1–6 (every reference is `${p_…}`) → Workflow B |
+| "publish the view", "make it live", "apply my changes"                               | ⚠️ `publish` `{ slug }`                                             |
+| "run active-clients for APAC", "execute the view", "get me the rows"                 | Workflow C → `get_definition`, `execute`                            |
+| "what parameters does X take", "what columns does X return"                          | `get_definition` `{ slug }`                                         |
+| "which views are published / live"                                                   | `list_published`                                                    |
+| "when was X last published", "did the publish work"                                  | `publications_for_view` `{ slug }`                                  |
+| "list data views", "find views with 'client' in the slug"                            | `list` (+ `slugContains`, `search`)                                 |
+| "show me the SQL for X"                                                              | `get_by_slug` → `cfgData.direct_sql`                                |
+| "it says publish the data view first"                                                | ⚠️ `publish`, then retry `execute`                                  |
+| "rejected for clients_b"                                                             | rewrite to `usdf.clients` → Workflow B                              |
+| "stop the view", "unpublish X"                                                       | ⚠️ `unpublish` `{ slug }`                                           |
+| "delete the data view"                                                               | Workflow E (ask which delete)                                       |
+| "is Pivotly up"                                                                      | `pivotly_ping`                                                      |
+
+## Pitfalls
+
+- **Two different `parameters`.** `cfg_data.parameters` is the declaration array (`[{ name, type, default, required }]`) used on `create` / `update`; the top-level tool property `parameters` is the execute-time value object (`{ "p_region": "APAC" }`). Don't send one where the other belongs.
+- **Prefix in all three places.** Declaration `p_region`, SQL `${p_region}`, execute key `p_region` (no `${}` outside the SQL). The execute endpoint's own regex (`^[a-z][a-z0-9_]*$`) would accept `region`, but the published function has no such argument — always use `get_definition` names.
+- **Reference syntax changed in this revision.** Earlier versions of this skill wrote bare `p_region` in `direct_sql`; the reference doc (rev 2026-09-23) specifies `${p_region}`. Views already saved with bare names: how publish treats them is not documented — when editing one, migrate it (Workflow B) and re-publish.
+- **Save ≠ publish.** `create` / `update` succeed even with a broken manifest; errors appear at `publish`. After an `update`, the old function keeps running until the next `publish`.
+- **Ordinary rejections arrive as HTTP 5xx** (every publish validation code, duplicate slug, `UNPUBLISH_FAILED`). Branch on `error` / `message`, never on status alone; don't auto-retry. Reliable 4xx: request shape (400), publish `NOT_FOUND`, execute 404/400, 403.
+- **`implementation: "view"` is not executable** via `execute` — you get 404. Use `function` unless the user explicitly wants otherwise.
+- **Optional parameters become NULL.** A non-required parameter without a default, and any expression default, binds as `DEFAULT NULL`; `col = p_x` then returns nothing. Write NULL-safe predicates.
+- **Base/archive tables are rejected.** `usdf.clients_b` / `usdf.clients_c` → use `usdf.clients`.
+- **`columns` may be empty** in `get_definition` — describe results from the rows instead.
+- **`delete_config_item` does not stop the view** — `unpublish` does.
+- **Not documented — kept explicit:** the tool's exact result / failure delivery (`isError` vs envelope); in-progress/failed `status` values; which expressions a `default` may contain; accepted string formats for `date` / `timestamptz` values; publish behavior when SQL references and declared parameters don't match. Read results before chaining; ask before retrying.
+- **Out of scope:** `builder` mode (`builder.sources` — missing it → `INVALID_CFG_DATA`; `INVALID_FILTER_OP`) and the `/v3/views/...` runtime query surface (§13).
+
+---
+
+## File: references/data_view-api.md
+
+---
+config_item: data_view
+plane: config-item
+api_version: v3
+doc_revision: 2026-09-28-r2
+generator: pci-api-refdoc-generator
+---
+
+# Data View (`data_view`) — REST API Reference
+
+A consumer-facing HTTP contract for authoring, publishing, inspecting and running **data views** on the Pivotly platform. It is written so that a skill or MCP tool can be built from it without reading the platform source: every field states its type, its requiredness (`!` required-to-send / `?` optional), its effective constraint, the layer and stage that enforce it, and every failure states its HTTP status and where its code appears on the wire.
+
+**Layer tags** used throughout (categories, not implementation names):
+
+| Tag               | Meaning                                                                                                    | Rejects with                                                    |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `[REST]`          | Request-shape validation at the API edge, before any platform call                                         | 400                                                             |
+| `[authz]`         | Permission check (object type + action verb)                                                               | 403 (non-standard body, see §3)                                 |
+| `[service]`       | API-side checks inside the handler (type/id matching, parameter-name check on execute, publication lookup) | 400 / 404 / 500                                                 |
+| `[save-fn]`       | The platform config-item save step (defaulting, patch-merge, hard checks)                                  | 409-class and 400-class conditions surface as **500** (see §11) |
+| `[DB-validator]`  | The platform data-view validator that runs inside save, on the resolved record                             | **500** with a `details[]` list                                 |
+| `[DB-constraint]` | Storage constraints on the stored record                                                                   | **500**                                                         |
+| `[DB-publish]`    | Checks and compilation performed by the publish step                                                       | 404 / **500**                                                   |
+
+---
+
+## 1. Overview
+
+A **data view** is a governed, versioned config item (`item_type = "data_view"`, identified by a globally unique `slug`) whose `cfg_data` declares a **read-only, parameterizable query** over published domains. It is authored in one of two modes:
+
+- `direct_sql` — the author writes a single `SELECT` body;
+- `builder` — the author declares sources, projected columns and filters, and the platform compiles the `SELECT`.
+
+The lifecycle covered by this document:
+
+1. **Author** the item with the generic config-item lifecycle (§8): create, read, list, update, soft-delete. Saving runs the data-view validator (§6) — saving never compiles or runs the query.
+2. **Publish** it (§9.1): the platform compiles the stored `cfg_data` into a callable read function, derives its output columns from the query itself, and records a **publication** (an immutable snapshot of `cfg_data`). Publishing is a separate call from saving and is the only step that checks the SQL can actually compile.
+3. **Inspect** publications (§9.3, §9.4) and the published **definition** — parameters and output columns (§10.1).
+4. **Run** the published view with typed named parameters (§10.2).
+5. **Unpublish** (§9.2) to remove the compiled function and the most recent publication record.
+
+Key behaviours a caller must know up front (each is detailed at its endpoint):
+
+- **Saving and publishing are independent.** Editing a published data view does not change what runs until it is published again; run/definition always use the most recent completed publication.
+- **Update is a full resubmission** (§8.6): the update route requires `slug`, `item_type` and a complete `cfg_data` every time, and `cfg_data` is replaced wholesale.
+- **Soft-delete only disables** (§8.7): the item's `enabled` becomes `false` and its version is bumped, but it is **not** marked deleted, still appears in reads, and can still be published.
+- **Most platform-side rejections surface as HTTP 500**, not 4xx, and platform error codes are generally **not** returned as a field — only the message (and, for save validation, a `details[]` list whose entries carry codes). See §11.
+
+## 2. Base URL & versioning
+
+- Every endpoint in this document lives under a configurable **base path** (default `/api`) followed by the version segment **`/v3`**.
+- Full URL = `<scheme>://<host>` + `BASE_PATH` (default `/api`) + `/v3` + resource prefix + sub-path.
+- Two resource prefixes are used:
+  - `/v3/config-items` — generic config-item lifecycle (§8). The item type is a path segment: `/v3/config-items/data_view/...`. The list-by-filter endpoint (§8.1) takes the type as a query parameter instead.
+  - `/v3/data-views` — data-view publish, publication reads, definition and execute (§9, §10).
+- Examples below assume `https://pivotly.example.com/api`.
+
+| Prefix             | Example full URL                                                                    |
+| ------------------ | ----------------------------------------------------------------------------------- |
+| `/v3/config-items` | `https://pivotly.example.com/api/v3/config-items/data_view/by-slug/dvw-open-orders` |
+| `/v3/data-views`   | `https://pivotly.example.com/api/v3/data-views/dvw-open-orders/execute`             |
+
+- Request bodies are JSON (`Content-Type: application/json`). An empty or whitespace-only JSON body is treated as `{}`. On every endpoint that accepts a request body (POST / PATCH / DELETE — including publish and unpublish, which ignore theirs), a JSON body that does not parse is rejected with **400** (standard error envelope, `message` = the JSON parser's message), and a body sent with a content type the API does not accept is rejected by the HTTP framework with **415** (standard envelope). The maximum request body size is a deployment setting (default 10 GiB); a larger body is rejected with **413** (standard envelope).
+
+## 3. Authentication & authorization
+
+**Headers (every endpoint in this document):**
+
+| Header          | Req.        | Type / format      | Purpose                                                                                                                                                                                                                                          |
+| --------------- | ----------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Authorization` | !           | `Bearer <JWT>`     | An OIDC-issued access token. Must be a signed token (unsigned `alg: none` tokens are rejected) accepted for this API's issuer and audience.                                                                                                      |
+| `X-Tenant-Id`   | ?           | uuid               | Tenant context passed to the permission check. When present it **must be a valid uuid** — a non-uuid value makes the permission check itself fail (**500**). Whether a caller without it is permitted depends on that caller's role assignments. |
+| `X-App-Slug`    | ?           | string             | App context passed to the permission check. No format enforced.                                                                                                                                                                                  |
+| `Content-Type`  | ! on bodies | `application/json` | Required for POST / PATCH / DELETE requests that carry a body.                                                                                                                                                                                   |
+
+**Authentication failures** (standard error envelope, §4):
+
+| Condition                                                          | Status | `message`                                                                  |
+| ------------------------------------------------------------------ | ------ | -------------------------------------------------------------------------- |
+| No `Authorization` header, or not `Bearer <token>`                 | 401    | `Missing bearer token`                                                     |
+| Token header cannot be decoded                                     | 401    | `Invalid token format`                                                     |
+| Unsigned token                                                     | 401    | `Unsecured tokens are not accepted`                                        |
+| Token fails signature / issuer / audience / expiry verification    | 401    | `Token validation failed`                                                  |
+| Valid token, but the identity is not registered as a platform user | 401    | `Authenticated user was not found in IAM`; `meta.code` = `USER_NOT_IN_IAM` |
+
+**Authorization.** Every endpoint in this document is authorized by **object type `data_view` + an action verb** `[authz]`. The caller's roles (evaluated in the context of `X-Tenant-Id` / `X-App-Slug`) must grant that verb on `data_view`. No per-record (ACL) check applies to data views.
+
+| Endpoint                                       | Action verb                                                         |
+| ---------------------------------------------- | ------------------------------------------------------------------- |
+| §8.1 List by column filter                     | `list` (on the object type named by the `itemType` query parameter) |
+| §8.2 Get by slug, §8.3 Get by id               | `view`                                                              |
+| §8.4 Paginated list                            | `list`                                                              |
+| §8.5 Create                                    | `create`                                                            |
+| §8.6 Update                                    | `change`                                                            |
+| §8.7 Soft-delete                               | `delete`                                                            |
+| §9.1 Publish                                   | `publish`                                                           |
+| §9.2 Unpublish                                 | `change`                                                            |
+| §9.3, §9.4 Publication reads, §10.1 Definition | `view`                                                              |
+| §10.2 Execute                                  | `run`                                                               |
+
+**Authorization failures return a non-standard body** — a single `error` string, **not** the §4 envelope:
+
+| Condition                                                                    | Status | Body                                                                                                         |
+| ---------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------ |
+| The object type could not be resolved (on §8.1: `itemType` missing or empty) | 403    | `{ "error": "Authorization Failed. Incorrect config or invalid id was provided" }`                           |
+| The caller's roles do not grant the verb                                     | 403    | `{ "error": "Authorization failed. You don't have access to perform this action." }`                         |
+| The permission check itself fails (e.g. `X-Tenant-Id` not a uuid)            | 500    | standard envelope; `message` is a generic authorization-check failure text — treat as an opaque server error |
+
+**Check order.** On most endpoints request validation `[REST]` runs **before** authorization, so a malformed request returns 400 even for a caller who lacks permission. Exception: §8.1 checks authorization first. Each endpoint states its order.
+
+## 4. Standard response envelope
+
+**Success** (all endpoints):
+
+```json
+{
+  "data": "<endpoint-specific>",
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "optional string",
+  "pagination": { "page": 0, "page_size": 25, "total_records": 3 }
+}
+```
+
+| Field        | Type    | Always present | Notes                                                                                                                                     |
+| ------------ | ------- | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`       | any     | yes            | Endpoint-specific payload.                                                                                                                |
+| `meta`       | object  | yes            | `{}` unless the endpoint states otherwise.                                                                                                |
+| `status`     | integer | yes            | Mirrors the HTTP status (200 or 201).                                                                                                     |
+| `error`      | boolean | yes            | Always `false`.                                                                                                                           |
+| `message`    | string  | no             | Present only when the endpoint sets one (stated per endpoint).                                                                            |
+| `pagination` | object  | no             | Present only on paginated endpoints: `page` (integer, zero-based, or `null`), `page_size` (integer or `null`), `total_records` (integer). |
+
+**Error** (all failures except the 403 authorization bodies in §3):
+
+```json
+{
+  "data": null,
+  "meta": {},
+  "status": 400,
+  "error": true,
+  "message": "Slug is required",
+  "details": [
+    { "field": "data.slug", "message": "Slug is required", "code": "too_small" }
+  ]
+}
+```
+
+| Field     | Type    | Always present | Notes                                                                                                                                                                                                                                                                                                                            |
+| --------- | ------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `data`    | null    | yes            | Always `null`.                                                                                                                                                                                                                                                                                                                   |
+| `meta`    | object  | yes            | Usually `{}`. On platform save/publish failures it carries context (e.g. `{ "action", "id", "slug", "item_type" }` on save; `{ "slug", ... }` on publish). On the unregistered-user 401 it carries `code`.                                                                                                                       |
+| `status`  | integer | yes            | Mirrors the HTTP status.                                                                                                                                                                                                                                                                                                         |
+| `error`   | boolean | yes            | Always `true`.                                                                                                                                                                                                                                                                                                                   |
+| `message` | string  | yes            | Human-readable reason. For request-shape failures it is the single issue's text, or `Schema validation error` when there are several issues. For platform failures this is the platform's message — the **only** place most platform conditions can be recognized (see §11).                                                     |
+| `details` | array   | no             | Present only when there is structured detail: (a) request-shape failures — `[{ field, message, code }]` where `code` is the request-validator issue code (§11.2); (b) data-view save validation failures — `[{ path, code, detail, severity, remediation, current?, proposed? }]` where `code` is a data-view rule code (§11.3). |
+
+There is **no dedicated error-code field** in the envelope. Codes reach the caller only inside `details[]` entries (`details[].code`) or, for the unregistered-user 401, in `meta.code`.
+
+## 5. Pagination, sorting & filtering
+
+Three endpoints paginate: §8.4 (config items of this type), §9.3 (published data views) and §9.4 (publication history of one data view). They share one grid-style convention; the differences are the page-size bounds and the fields each accepts, stated at each endpoint.
+
+**Query parameters**
+
+| Param         | Type                          | Req. | Bounds / format                                                                                                       | Default                     | Notes                                                                                                                        |
+| ------------- | ----------------------------- | ---- | --------------------------------------------------------------------------------------------------------------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `page`        | integer (coerced from string) | ?    | ≥ 0                                                                                                                   | `0`                         | Zero-based. Non-numeric → 400.                                                                                               |
+| `pageSize`    | integer (coerced)             | ?    | §8.4: 1–100; §9.3/§9.4: 1–500                                                                                         | §8.4: `25`; §9.3/§9.4: `20` | Out of range → 400.                                                                                                          |
+| `sortModel`   | string (JSON-encoded array)   | ?    | `[{ "field": string, "sort": "asc" \| "desc" }]`                                                                      | endpoint default order      | **Invalid JSON or a non-conforming value is silently ignored** (default order applies). Unknown fields are silently skipped. |
+| `filterModel` | string (JSON-encoded)         | ?    | Either an array of filter items, or `{ items: [...], logicOperator?, quickFilterValues?, quickFilterLogicOperator? }` | no filter                   | **Invalid JSON or a non-conforming value is silently ignored** (no filtering). Items on unknown fields are silently skipped. |
+
+**Filter item**: `{ "field": string!, "operator": <operator>!, "value"?: string | number | boolean | null | string[] | number[] }`.
+
+**Operators** (every value accepted by the request layer):
+
+| Operator                                               | Meaning                                                                                                      |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `contains`, `doesNotContain`, `startsWith`, `endsWith` | Case-insensitive substring / prefix / suffix match; `value` must be a string, otherwise the item is ignored. |
+| `equals`, `is`, `=`                                    | Equal.                                                                                                       |
+| `doesNotEqual`, `not`, `!=`                            | Not equal.                                                                                                   |
+| `>`, `>=`, `<`, `<=`                                   | Comparison.                                                                                                  |
+| `after`, `onOrAfter`, `before`, `onOrBefore`           | Comparison (`>`, `>=`, `<`, `<=`), intended for timestamps.                                                  |
+| `isEmpty`, `isNotEmpty`                                | Null-or-empty / not-null-and-not-empty; `value` ignored.                                                     |
+| `isAnyOf`                                              | Membership; `value` must be a non-empty array, otherwise the item is ignored.                                |
+
+Comparison operators with `value` absent or `null` are ignored. On uuid-typed fields a value that is not a complete uuid is matched as a case-insensitive substring instead of by equality (§8.4 and §9.4 only). A value whose type the stored column cannot accept (e.g. a non-numeric value on a numeric field, or an unknown value on the publication `status` field) makes the query fail with **500**.
+
+**logicOperator / quickFilterLogicOperator**: `and` (default) | `or`. `quickFilterValues`: array of strings; each term is matched case-insensitively as a substring across the endpoint's quick-filter fields (a term matches if any field matches); terms are combined with `quickFilterLogicOperator`. Blank terms are ignored.
+
+**Sort directions**: `asc`, `desc`.
+
+**Pagination response**: `pagination = { page, page_size, total_records }`; `total_records` counts all rows matching the filters.
+
+## 6. The data_view config item (cfg_data)
+
+### 6.1 Item envelope fields (outside `cfg_data`)
+
+These are sent inside `data` on create/update (§8.5, §8.6). Effective requiredness and rules are resolved per endpoint there; this table gives each field's combined constraint.
+
+| Field            | Type            | Combined constraint (caller must satisfy all)                                                                                                                                                                                                                                        | Layers                                                                                                                                                                                                         |
+| ---------------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `slug`           | string          | Length 1–128 **and** matches `^[a-z][a-z0-9_-]{0,127}$` (lowercase letter first; then lowercase letters, digits, `_`, `-`) **and** does not start with `sys_`, `dtm_`, `dtm-`, `dtv_` or `dtv-` **and** is unique across **all** config items of every type. Immutable after create. | `[REST]` 1–255 chars; `[DB-validator]` pattern + ≤128 (`VALUE`), reserved prefixes (`RESERVED_PREFIX_SYS`, `RESERVED_PREFIX_DTM_DTV`); `[DB-constraint]` same pattern; `[save-fn]` uniqueness and immutability |
+| `item_type`      | string          | Must be exactly `data_view` (must equal the path segment). Immutable.                                                                                                                                                                                                                | `[REST]` 1–100 chars; `[service]` equals path; `[save-fn]` immutable                                                                                                                                           |
+| `name`           | string          | ≤ 255 chars. Must resolve to a non-empty value: on create an absent or `""` `name` defaults to the slug (a whitespace-only value is stored as sent — create does not trim); on update values are trimmed and an empty or whitespace-only value is rejected.                          | `[REST]` ≤255, not `null`; `[save-fn]` default; `[DB-validator]` `REQUIRED`                                                                                                                                    |
+| `description`    | string \| null  | ≤ 1000 chars. No format. On create stored as sent (`""` stays `""`); on update trimmed, and `null` / `""` / whitespace-only clear it to `null`.                                                                                                                                      | `[REST]`, `[save-fn]`                                                                                                                                                                                          |
+| `enabled`        | boolean \| null | On create `null`/absent → `true`. On update `null` is rejected by storage (500).                                                                                                                                                                                                     | `[REST]`; `[save-fn]` default; `[DB-constraint]` not null                                                                                                                                                      |
+| `full_path`      | string          | ≤ 500 chars; not `null`. On create absent or `""` → the slug (whitespace-only stored as sent). On update trimmed, and an empty or whitespace-only value is rejected by storage (500). No format enforced.                                                                            | `[REST]`; `[save-fn]`; `[DB-constraint]` not null                                                                                                                                                              |
+| `parent_item_id` | string (uuid)   | Must match `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` (case-insensitive). Not `null`. Existence of the referenced item is **not checked** anywhere.                                                                                                            | `[REST]`                                                                                                                                                                                                       |
+| `version`        | integer         | Positive integer if sent. **Ignored** — the platform sets version 1 on create and increments on every update.                                                                                                                                                                        | `[REST]`                                                                                                                                                                                                       |
+| `id`             | string (uuid)   | Uuid format. Forbidden on create; on update must equal the path id.                                                                                                                                                                                                                  | `[REST]`, `[service]`                                                                                                                                                                                          |
+| `cfg_data`       | object          | Required JSON object (not an array). Content rules in §6.2–§6.8.                                                                                                                                                                                                                     | `[REST]` object; `[DB-validator]` object (`TYPE`)                                                                                                                                                              |
+
+Unknown keys inside `data` (for example `is_deleted`) are **stripped** by the request layer and never reach the platform.
+
+### 6.2 `cfg_data` — top-level fields
+
+`cfg_data` is stored **exactly as sent** (wholesale). Only the rules below are enforced; any other key is accepted and stored without validation. `[DB-validator]` rules run at **save** (create, update, soft-delete); `[DB-publish]` rules run at **publish** and stop at the first failure.
+
+| Field            | Type                      | Req.                                            | Allowed values / rule                                                                                                                                                                                      | Enforced at                                                                                                           | Description                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------- | ------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `authoring_mode` | string                    | ? at save; effectively ! for a publishable view | `builder`, `direct_sql`                                                                                                                                                                                    | save `[DB-validator]` (`VALUE` if another value); publish `[DB-publish]` (absent or `null` → treated as `direct_sql`) | Which body is used. **Save does not require it**, and when it is absent none of the save-time body checks run. See §6.8 for what publish does when it is absent. `""` is treated as absent at save but is rejected at publish (`Invalid authoring_mode ""`).                                                                                                                                                                                   |
+| `direct_sql`     | string                    | ! when `authoring_mode = "direct_sql"`          | Non-empty `SELECT` body; rules in §6.3                                                                                                                                                                     | save + publish                                                                                                        | The SQL body.                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `builder`        | object                    | ! when `authoring_mode = "builder"`             | Object with a non-empty `sources` array; rules in §6.4                                                                                                                                                     | save + publish                                                                                                        | Structured query definition.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `implementation` | string                    | ?                                               | `function`, `view`. Default `function`.                                                                                                                                                                    | save `[DB-validator]` (`VALUE`); immutable once published (`IMMUTABLE_IMPLEMENTATION`)                                | Publish **always** produces a function, whatever this value is. Because every publication is recorded as `function`, sending `view` while a completed publication record exists for the slug is rejected with `IMMUTABLE_IMPLEMENTATION` (after every record has been removed by §9.2, `view` is accepted again at save). `""` is treated as absent at save but rejected at publish (`Invalid implementation ""`). Send `function` or omit it. |
+| `parameters`     | array of object           | ?                                               | Array (not `null`); items per §6.5                                                                                                                                                                         | save + publish                                                                                                        | Named inputs of the published function, in order.                                                                                                                                                                                                                                                                                                                                                                                              |
+| `columns`        | array of object           | ?                                               | Items per §6.6                                                                                                                                                                                             | save (duplicate names only)                                                                                           | Declared output-column metadata. Used only for the published definition (§10.1); never used to compile the query.                                                                                                                                                                                                                                                                                                                              |
+| `slug`           | string                    | ?                                               | If present and non-empty, must equal the outer `slug` exactly (`SLUG_DENORM_MATCH`; additionally `IMMUTABLE_SLUG_DENORM` once published)                                                                   | save `[DB-validator]`                                                                                                 | Optional copy of the item slug.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `area`           | string \| array of string | ?                                               | A non-blank string, or a non-empty array whose every element is a non-blank string. `null`, an empty array, a blank string, a non-string element or any other type is rejected (`INVALID_DATA_VIEW_AREA`). | save `[DB-validator]`                                                                                                 | Grouping label(s). At publish, values are trimmed, de-duplicated and stored with the publication metadata.                                                                                                                                                                                                                                                                                                                                     |
+| `description`    | string                    | ?                                               | None enforced (expected string; not enforced)                                                                                                                                                              | nowhere                                                                                                               | Free text. Distinct from the outer `description`.                                                                                                                                                                                                                                                                                                                                                                                              |
+| `_runtime`       | object                    | —                                               | Do not send. Not populated by any endpoint in this document; if sent it is stored verbatim like any other unknown key.                                                                                     | nowhere                                                                                                               | Reserved.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+### 6.3 `direct_sql` rules
+
+| Rule                             | Predicate (exact)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Stage                                                                                                    | Code / result                                                                                                                                                                                                                                  |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Body required                    | `authoring_mode = "direct_sql"` and `direct_sql` is absent, `null` or `""`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | save                                                                                                     | `AUTHORING_MODE_REQUIRES_BODY` (path `$.cfg_data.direct_sql`)                                                                                                                                                                                  |
+| Body required (publish)          | effective mode is `direct_sql` (explicit, or `authoring_mode` absent) and `direct_sql` is empty after trimming                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | publish                                                                                                  | message `authoring_mode is "direct_sql" but direct_sql is empty.` (500)                                                                                                                                                                        |
+| No DDL/DML keywords              | Case-insensitive **whole-word** match anywhere in the body (comments and string literals included) of any of: `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COMMENT`, `COPY`, `REINDEX`, `VACUUM`, `ANALYZE`, `CLUSTER`, `LOCK`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`. Word boundaries treat `_` as a word character, so `last_update` or `created_at` do not match; a column literally named `comment` or a literal `'delete'` does.                                                                                                                                                                                                                                                  | save (only when `authoring_mode = "direct_sql"`) and publish (only when `authoring_mode = "direct_sql"`) | save: one `INVALID_SQL_DDL_KEYWORD` detail **per keyword found** (with `current` = the keyword). Publish: stops at the first keyword, 500 with message `Remove the DDL/DML keyword or refactor as a parameterized SELECT.` and `meta.keyword`. |
+| No base/archive table references | Save: body matches (case-insensitive) `usdf\.[a-z][a-z0-9_]*_(b\|c)` ending at a word boundary. Publish: body matches (case-insensitive) `\musdf\.[a-z_][a-z0-9_]*_b\M` or `\musdf\.[a-z_][a-z0-9_]*_c\M`. In words: a reference such as `usdf.orders_b` or `usdf.orders_c` is rejected; query the domain's read view `usdf.<domain_slug>` instead.                                                                                                                                                                                                                                                                                                                                                  | save and publish (only when `authoring_mode = "direct_sql"`)                                             | save: `INVALID_SQL_BASE_TABLE_REFERENCE`; publish: 500 with message `Replace usdf.clients_b with usdf.clients (etc.).`                                                                                                                         |
+| Must compile                     | The body must be a single `SELECT` that compiles against the published domain read views, with every declared parameter referenced **by its bare name** (e.g. `p_status`) or positionally (`$1`, `$2`, … in declared order). Placeholder syntaxes such as `:p_status` are **not** supported and make publish fail.                                                                                                                                                                                                                                                                                                                                                                                   | publish                                                                                                  | 500 — see §9.1 rule 15 for the message forms                                                                                                                                                                                                   |
+| `${...}` tokens                  | Any `${namespace:key}` token in the body is replaced **at publish time** by a quoted text literal resolved with no record or request context: `${env:<key>}` → the value of the platform variable of type `env` whose slug is `<key>`; `${settings:<key>[.path]}` → the platform setting (with optional JSON path); `${template:<slug>}` → that template rendered with no record or context; every other namespace (`record`, `context`, `stage`, `process`, or a bare `${name}`) resolves to the empty string `''`, as does any reference that cannot be resolved. The value is frozen into the published function; it is not re-resolved at run time. Do not use `${...}` to reference parameters. | publish                                                                                                  | —                                                                                                                                                                                                                                              |
+
+Reference the domain read view as `usdf.<domain_slug>`: that name is part of the query text the caller authors, and the platform's own validation messages use it.
+
+### 6.4 `builder` rules
+
+`builder` object — sub-fields:
+
+| Field             | Type            | Req.                                | Rule                                                                                                                                                                                                                                            | Enforced at         |
+| ----------------- | --------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `builder.sources` | array of object | ! when `authoring_mode = "builder"` | Non-empty array (`AUTHORING_MODE_REQUIRES_BODY` at save when `builder` is not an object or `sources` is not a non-empty array). At publish a missing `sources` fails with message `authoring_mode is "builder" but builder.sources is missing.` | save + publish      |
+| `builder.columns` | array of object | ?                                   | Projection list; absent or all entries excluded → `SELECT *`. Not validated at save.                                                                                                                                                            | publish only        |
+| `builder.filters` | array of object | ?                                   | `op` checked at save; the rest at publish.                                                                                                                                                                                                      | save (op) + publish |
+| `builder.sort`    | any             | ?                                   | **Not used** — no `ORDER BY` is compiled. Not validated.                                                                                                                                                                                        | nowhere             |
+| `builder.limit`   | any             | ?                                   | **Not used** — no `LIMIT` is compiled. Not validated.                                                                                                                                                                                           | nowhere             |
+
+`builder.sources[]` item:
+
+| Field                         | Type   | Req.                                               | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Enforced at    |
+| ----------------------------- | ------ | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `domain`                      | string | ! (for the primary; for joined sources to be used) | Save: each source that is an object must have at least one non-empty value among `domain`, `view_slug`, `data_view_slug` (`INVALID_SOURCE_DOMAIN`, path `$.cfg_data.builder.sources[<n>]`); no format check at save. Publish: compiles only `domain` (as a quoted identifier of `usdf.<domain>`); `view_slug` / `data_view_slug` are ignored by publish, so a primary source without `domain` fails publish. The named domain must have a published read view; existence is checked only when the query is compiled at publish (500). | save + publish |
+| `view_slug`, `data_view_slug` | string | ?                                                  | Accepted by the save check above as alternatives to `domain`; not used by publish.                                                                                                                                                                                                                                                                                                                                                                                                                                                    | save           |
+| `role`                        | string | ! for the primary                                  | `primary` or `joined` (expected; not enforced — any other value makes the source ignored). Exactly one `primary` is expected: if several are present **the last one wins**; if none is present, publish compiles a query that returns no rows (a single integer column), and publish still succeeds.                                                                                                                                                                                                                                  | publish        |
+| `alias`                       | string | ?                                                  | Quoted as an identifier; no format enforced at save or publish.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | publish        |
+| `join_type`                   | string | ? (joined only)                                    | Emitted verbatim into the compiled query; default `LEFT JOIN` only when absent or `null` (`""` is emitted as-is and fails publish). Expected one of `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL JOIN`, `INNER`, `LEFT`, `RIGHT`, `FULL` (expected; not enforced — an invalid value makes publish fail with 500).                                                                                                                                                                                                                   | publish        |
+| `join_on`                     | string | ? (joined only)                                    | SQL join condition emitted verbatim; default `true`. Not validated; must compile.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | publish        |
+
+Only sources with `role = "joined"` and a non-empty `domain` are joined.
+
+`builder.columns[]` item:
+
+| Field       | Type    | Req. | Rule                                                                                    | Enforced at |
+| ----------- | ------- | ---- | --------------------------------------------------------------------------------------- | ----------- |
+| `attribute` | string  | !    | Output column source attribute, quoted as an identifier. Missing → publish fails (500). | publish     |
+| `source`    | string  | ?    | Source alias qualifier, quoted as an identifier.                                        | publish     |
+| `alias`     | string  | ?    | Output column name (`AS "<alias>"`).                                                    | publish     |
+| `included`  | boolean | ?    | Default `true`; only JSON `false` (or the string `"false"`) excludes the column.        | publish     |
+| `sort`      | any     | ?    | Not used.                                                                               | nowhere     |
+
+`builder.filters[]` item:
+
+| Field    | Type                               | Req.                      | Rule                                                                                                                                                                                                                                                                                      | Enforced at                                                                                                                                                                                                                                |
+| -------- | ---------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `column` | string                             | ! for the filter to apply | Filters with an absent/empty `column` are skipped. Quoted as **one** identifier — use an unqualified column name (`status`); a qualified value such as `a.status` is treated as a single column named `a.status` and fails publish.                                                       | publish                                                                                                                                                                                                                                    |
+| `op`     | string                             | ?                         | One of `equals`, `not equals`, `greater than`, `less than`, `in`, `is null`, `is not null`. Default `equals`. Compiled to `=`, `!=`, `>`, `<`, `IN`, `IS NULL`, `IS NOT NULL`. ⚠️ `in` compiles to `IN <single text literal>`, which is not valid SQL; a filter using `in` fails publish. | save (`INVALID_FILTER_OP`, only when `op` is non-empty) + publish (message `Unsupported filter operator: "<op>"`, 500; checked only when a primary source exists; an `op` of `""` passes save but fails publish; absent/`null` → `equals`) |
+| `value`  | string (other JSON is stringified) | ?                         | Emitted as a quoted text literal; absent/`null` → `NULL`. Ignored for `is null` / `is not null`. Values are fixed at publish — builder filters cannot reference parameters.                                                                                                               | publish                                                                                                                                                                                                                                    |
+| `logic`  | string                             | ?                         | Emitted verbatim between filters; default `AND`. Ignored on the first filter. Expected `AND` or `OR` (expected; not enforced — any other value makes publish fail).                                                                                                                       | publish                                                                                                                                                                                                                                    |
+
+### 6.5 `parameters[]` item
+
+Parameters become the named inputs of the published function, in array order.
+
+| Field         | Type                               | Req.                     | Rule (exact)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Enforced at    |
+| ------------- | ---------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `name`        | string                             | ! for publish; ? at save | Must match `^p_[a-z][a-z0-9_]*$` (the `p_` prefix is mandatory and used verbatim; no prefix is added or removed). Save checks only non-empty names (`INVALID_PARAMETER_NAME_PREFIX`); publish rejects an empty/blank name (message `Parameter at index <n> has no name.`) and a non-matching name (message quoting the pattern). Names must be unique within the array, compared **case-sensitively** (`DUPLICATE_PARAMETER_NAME`, one detail per duplicated name). No maximum length is enforced. | save + publish |
+| `type`        | string                             | ?                        | One of `text`, `integer`, `uuid`, `boolean`, `numeric`, `date`, `timestamptz` (`INVALID_PARAMETER_TYPE` at save; publish message `Parameter "<name>" has invalid type "<type>". Valid: ...`). Absent → `text`.                                                                                                                                                                                                                                                                                     | save + publish |
+| `required`    | boolean                            | ?                        | Default `false`. When `true` and no `default` is set, the parameter has no default and **must** be supplied on execute. Not validated at save. Read at publish only when no `default` is set; a value that cannot be read as a boolean (e.g. `"maybe"`) then makes publish fail (500).                                                                                                                                                                                                             | publish        |
+| `default`     | string (other JSON is stringified) | ?                        | A JSON `null` counts as not set. When set: the published parameter defaults to this value (whatever `required` says), which must be convertible to the parameter's `type` (otherwise publish fails, 500). When the value contains `${`, the published default is `NULL` instead (the expression is resolved only by platform-internal consumers, **not** by §10.2 Execute). When not set: `required = false` → default `NULL`; `required = true` → no default. Not validated at save.              | publish        |
+| `description` | string                             | ?                        | None enforced (expected string; not enforced).                                                                                                                                                                                                                                                                                                                                                                                                                                                     | nowhere        |
+| `data_type`   | string                             | ?                        | Legacy alias used only when `type` is absent. **Not validated at save or publish** — do not send; send `type`.                                                                                                                                                                                                                                                                                                                                                                                     | publish        |
+
+Collection rules on `parameters`:
+
+- `parameters` itself must be an array when present; `null` or any non-array value → `TYPE` (path `$.cfg_data.parameters`) at save.
+- Array entries that are not objects are ignored at save; at publish they fail the name check.
+- **Ordering:** once any parameter has a default (including the implicit `NULL` default of a non-required parameter), every parameter after it must also have one. A `required: true` parameter without `default` placed after an optional one makes publish fail (500). Put required parameters first.
+- Parameter changes on a published view are allowed at save; the next publish replaces the function signature.
+
+### 6.6 `columns[]` item
+
+| Field                                                 | Type   | Req. | Rule                                                                                                                                                                                                                                 | Enforced at     |
+| ----------------------------------------------------- | ------ | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| `name`                                                | string | ?    | Non-empty names must be unique within the array, compared case-sensitively (`DUPLICATE_COLUMN_NAME`, path `$.cfg_data.columns`). No format or length enforced.                                                                       | save            |
+| `source`                                              | string | ?    | Used by §10.1 to derive the column name: the second `.`-separated segment (`a.status` → `status`; `a.b.c` → `b`), or the whole value when it has no `.`. A declared column without `source` is reported with an empty name by §10.1. | definition read |
+| `type`                                                | string | ?    | Reported as-is by §10.1. Expected one of `text`, `integer`, `bigint`, `uuid`, `boolean`, `numeric`, `date`, `timestamptz`, `jsonb` (expected; not enforced).                                                                         | nowhere         |
+| other keys (`description`, `alias`, `source_attr`, …) | any    | ?    | Stored; not validated; not used.                                                                                                                                                                                                     | nowhere         |
+
+`columns` is validated only when it is an array. If `columns` is absent or empty at publish, the publication snapshot is filled with the output columns discovered from the compiled query (`name`, `source` and `type` of each), so §10.1 returns real names. If `columns` is non-empty, it is kept verbatim and §10.1 reports it as declared — the declared list is **not** checked against the query's real output.
+
+### 6.7 Save-time immutability once published
+
+"Published" means a completed publication exists for the slug (§9). While one exists:
+
+| Rule                    | Predicate (exact)                                                                                                 | Code                                                                                                                |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Implementation fixed    | `cfg_data.implementation` is present and differs from the latest publication's implementation (always `function`) | `IMMUTABLE_IMPLEMENTATION` (path `$.cfg_data.implementation`, `current` = published value, `proposed` = sent value) |
+| Denormalized slug fixed | `cfg_data.slug` is present, non-empty and differs from the outer slug                                             | `IMMUTABLE_SLUG_DENORM` — always reported **together with** `SLUG_DENORM_MATCH`                                     |
+
+The outer `slug` is immutable at all times (§8.6). The parameter signature is **not** immutable.
+
+### 6.8 How publish interprets `cfg_data` (summary)
+
+| `authoring_mode` | Publish requires                                                            | Query compiled from                                                                                                                                                                                                |
+| ---------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `direct_sql`     | non-empty `direct_sql`; no DDL/DML keyword; no base/archive table reference | `direct_sql`                                                                                                                                                                                                       |
+| `builder`        | `builder.sources` present                                                   | `builder` (a primary source with `domain`)                                                                                                                                                                         |
+| absent           | non-empty `direct_sql` (treated as `direct_sql` for this check)             | `builder` if `builder.sources` is a non-empty array, otherwise `direct_sql`. ⚠️ In this case the DDL/DML keyword and base-table checks are **not** applied at publish (nor at save). Always send `authoring_mode`. |
+
+Publish also checks each parameter's name and type (§6.5), then compiles the query and derives its output columns from the query itself. Publish does **not** re-run the save-time validator.
+
+## 7. Constants & enumerations
+
+| Set                                          | Values (complete)                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `item_type` for this document                | `data_view`                                                                                                                                                                                                                                                                                                                                |
+| Config item types with a save-time validator | `domain`, `template`, `picklist`, `form`, `action`, `rule_set`, `process`, `event_rule`, `data_view`, `data_extension`, `app`, `app_page`, `data_model`, `agent`, `grounding_recipe`, `harvester`, `term_set`, `criterion`, `criteria_pack`, `content`, `context`, `knowledge_analysis`, `answer_view_contract`, `reference_set`, `corpus` |
+| Slug pattern                                 | `^[a-z][a-z0-9_-]{0,127}$` (max 128 chars)                                                                                                                                                                                                                                                                                                 |
+| Reserved slug prefixes (rejected)            | `sys_`, `dtm_`, `dtm-`, `dtv_`, `dtv-`                                                                                                                                                                                                                                                                                                     |
+| Conventional slug prefix                     | `dvw-` / `dvw_` — not required and not enforced. When the published object name is derived, a leading `dvw-`/`dvw_` (any case) is removed and every `-` becomes `_`. Two data views whose slugs derive the same name (e.g. `dvw-orders`, `dvw_orders` and `orders`) **share one published function**: publishing one replaces the other's. |
+| `authoring_mode`                             | `builder`, `direct_sql`                                                                                                                                                                                                                                                                                                                    |
+| `implementation`                             | `function`, `view` (publish always produces `function`)                                                                                                                                                                                                                                                                                    |
+| Parameter `name` pattern                     | `^p_[a-z][a-z0-9_]*$`                                                                                                                                                                                                                                                                                                                      |
+| Parameter `type`                             | `text`, `integer`, `uuid`, `boolean`, `numeric`, `date`, `timestamptz`                                                                                                                                                                                                                                                                     |
+| Builder filter `op`                          | `equals`, `not equals`, `greater than`, `less than`, `in`, `is null`, `is not null`                                                                                                                                                                                                                                                        |
+| DDL/DML keywords (rejected in `direct_sql`)  | `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, `REVOKE`, `COMMENT`, `COPY`, `REINDEX`, `VACUUM`, `ANALYZE`, `CLUSTER`, `LOCK`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`                                                                                                                                                                      |
+| Publication `status`                         | `not_started`, `publishing`, `complete` (publish only ever records `complete`)                                                                                                                                                                                                                                                             |
+| Publication `implementation`                 | `function`, `view` (publish only ever records `function`)                                                                                                                                                                                                                                                                                  |
+| Execute parameter-key pattern                | `^[a-z][a-z0-9_]*$`                                                                                                                                                                                                                                                                                                                        |
+| Save-response `meta.action`                  | `insert`, `update`                                                                                                                                                                                                                                                                                                                         |
+| Action verbs (platform-wide)                 | `*`, `create`, `view`, `list`, `change`, `delete`, `manage`, `download`, `import`, `export`, `publish`, `sync`, `run`, `terminate`, `cancel`, `retry`, `pause`, `resume`, `clean`, `clear`, `resolve`, `chat` — this document uses `list`, `view`, `create`, `change`, `delete`, `publish`, `run`                                          |
+| Sort directions                              | `asc`, `desc`                                                                                                                                                                                                                                                                                                                              |
+| Filter operators                             | see §5 (21 values)                                                                                                                                                                                                                                                                                                                         |
+| Filter logic operators                       | `and`, `or`                                                                                                                                                                                                                                                                                                                                |
+| `fetchType` (§8.4)                           | `list`, `paginated`                                                                                                                                                                                                                                                                                                                        |
+| Validation detail `severity`                 | `error` (the data-view validator raises no warnings)                                                                                                                                                                                                                                                                                       |
+| Validation detail `remediation`              | `none`, `rename_and_retry`, `drop_and_recreate`                                                                                                                                                                                                                                                                                            |
+
+## 8. Endpoint reference — Authoring lifecycle
+
+**Config item read record.** The read endpoints §8.1–§8.4 return config items in this shape (camelCase keys). It is restated in full at each endpoint that returns it.
+
+| Field                                     | Type                        | Notes                                                                                                                                                                                                        |
+| ----------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                                      | string (uuid)               | Item id.                                                                                                                                                                                                     |
+| `itemType`                                | string                      | `data_view`.                                                                                                                                                                                                 |
+| `isDeleted`                               | boolean                     | Always `false` for items managed through this API (see §8.7).                                                                                                                                                |
+| `version`                                 | integer                     | Starts at 1; +1 on every update or soft-delete.                                                                                                                                                              |
+| `enabled`                                 | boolean                     | `false` after §8.7.                                                                                                                                                                                          |
+| `parentItemId`                            | null                        | Always `null`: the value is stored as a uuid but the read layer converts it to a number, which fails and is serialized as `null`. The stored `parent_item_id` is visible only in save responses (§8.5–§8.7). |
+| `name`                                    | string                      | Display name.                                                                                                                                                                                                |
+| `description`                             | string \| null              |                                                                                                                                                                                                              |
+| `slug`                                    | string                      |                                                                                                                                                                                                              |
+| `fullPath`                                | string                      |                                                                                                                                                                                                              |
+| `depth`                                   | integer                     | Server-computed: 1 + number of `/` characters in `fullPath`.                                                                                                                                                 |
+| `cfgData`                                 | object                      | The stored `cfg_data`, exactly as last saved.                                                                                                                                                                |
+| `createdAt`, `modifiedAt`                 | string (ISO-8601 timestamp) |                                                                                                                                                                                                              |
+| `createdBy`, `modifiedBy`                 | string (uuid) \| null       | Platform user ids.                                                                                                                                                                                           |
+| `createdByIdentity`, `modifiedByIdentity` | string \| null              | Display labels of those users.                                                                                                                                                                               |
+| `deletedAt`                               | string \| null              | Always `null` for items managed through this API.                                                                                                                                                            |
+
+**Save response row.** The write endpoints §8.5–§8.7 return the stored row in this shape (snake_case keys; timestamps are ISO-8601 with a numeric offset and up to six fractional-second digits (trailing zeros omitted), e.g. `2026-09-28T01:15:22.310412+00:00` — ⚠️ the offset shown depends on the platform's session time zone), restated at each endpoint: `id` (uuid), `item_type`, `is_deleted` (boolean), `deleted_at` (null), `version` (integer), `enabled` (boolean), `parent_item_id` (uuid \| null), `name`, `description` (string \| null), `slug`, `full_path`, `depth` (integer), `cfg_data` (object), `created_at`, `created_by` (uuid \| null), `modified_at`, `modified_by` (uuid \| null).
+
+### 8.1 List data views by column filter — GET /v3/config-items
+
+- **Classification:** consumer.
+- **Purpose:** exact-match lookup of config items by one or more columns, AND-combined. Returns an unpaginated page of rows, in no guaranteed order.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2 base URL; §3 authentication, authorization (verb `list` on the object type named by `itemType`), 403 body shape; §4 envelopes.
+- **Check order:** `[authz]` **first**, then `[REST]` query validation.
+
+**Query parameters** (every value arrives as a string; conversions as stated). Text filters are **exact, case-sensitive equality**.
+
+| Param          | Type              | Req. | Bounds / format                                                                                                        | Enforced                                  | Notes                                                                     |
+| -------------- | ----------------- | ---- | ---------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------- |
+| `itemType`     | string            | !    | Length ≥ 1; must be `data_view` for this document                                                                      | `[authz]` (missing/empty → 403), `[REST]` | Scopes results to that type; also the object type used for authorization. |
+| `id`           | string            | ?    | None at the request layer; must be a full uuid or the query fails (500)                                                | `[REST]` none                             |                                                                           |
+| `slug`         | string            | ?    | None enforced                                                                                                          | —                                         |                                                                           |
+| `name`         | string            | ?    | None enforced                                                                                                          | —                                         |                                                                           |
+| `description`  | string            | ?    | None enforced                                                                                                          | —                                         |                                                                           |
+| `fullPath`     | string            | ?    | None enforced                                                                                                          | —                                         |                                                                           |
+| `version`      | number (coerced)  | ?    | Must be numeric (non-numeric → 400)                                                                                    | `[REST]`                                  |                                                                           |
+| `depth`        | number (coerced)  | ?    | Must be numeric (non-numeric → 400)                                                                                    | `[REST]`                                  |                                                                           |
+| `enabled`      | boolean-like      | ?    | `true`/`false`/`1`/`0` (case-insensitive) → boolean; any other string is passed through and makes the query fail (500) | `[REST]` conversion only                  |                                                                           |
+| `isDeleted`    | boolean-like      | ?    | Same as `enabled`                                                                                                      | `[REST]` conversion only                  | Always `false` for data views (§8.7).                                     |
+| `createdBy`    | string            | ?    | Must be a full uuid or the query fails (500)                                                                           | —                                         |                                                                           |
+| `modifiedBy`   | string            | ?    | Must be a full uuid or the query fails (500)                                                                           | —                                         |                                                                           |
+| `parentItemId` | string            | ?    | ⚠️ Not determinable from source whether this filter can match (see `parentItemId` above)                               | —                                         |                                                                           |
+| `page`         | integer (coerced) | ?    | ≥ 1                                                                                                                    | `[REST]`                                  | Default `1` (one-based on this endpoint).                                 |
+| `limit`        | integer (coerced) | ?    | ≤ 100; **no minimum** — `0` returns `[]`, a negative value fails (500)                                                 | `[REST]`                                  | Default `25`.                                                             |
+
+Unknown query parameters are stripped.
+
+**Success — 200**
+
+```json
+{
+  "data": [
+    {
+      "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+      "itemType": "data_view",
+      "isDeleted": false,
+      "version": 3,
+      "enabled": true,
+      "parentItemId": null,
+      "name": "Open orders",
+      "description": "Open orders filtered by status",
+      "slug": "dvw-open-orders",
+      "fullPath": "dvw-open-orders",
+      "depth": 1,
+      "cfgData": {
+        "authoring_mode": "direct_sql",
+        "implementation": "function",
+        "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+        "parameters": [
+          { "name": "p_status", "type": "text", "required": false }
+        ]
+      },
+      "createdAt": "2026-09-20T02:11:05.120Z",
+      "createdBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+      "createdByIdentity": "Jordan Lee",
+      "modifiedAt": "2026-09-27T08:40:12.004Z",
+      "modifiedBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+      "modifiedByIdentity": "Jordan Lee",
+      "deletedAt": null
+    }
+  ],
+  "meta": {},
+  "status": 200,
+  "error": false
+}
+```
+
+`data` is an array of config item read records, each with: `id` (uuid), `itemType` (`data_view`), `isDeleted` (boolean, always `false`), `version` (integer), `enabled` (boolean), `parentItemId` (always `null`), `name` (string), `description` (string \| null), `slug` (string), `fullPath` (string), `depth` (integer), `cfgData` (object), `createdAt` / `modifiedAt` (ISO timestamp), `createdBy` / `modifiedBy` (uuid \| null), `createdByIdentity` / `modifiedByIdentity` (string \| null), `deletedAt` (null). No `pagination`, no `message`.
+
+**Errors**
+
+| Status | Trigger                                                                                                      | `message` / body                                                                     | Code location                          |
+| ------ | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ | -------------------------------------- |
+| 401    | Authentication failure (§3)                                                                                  | per §3                                                                               | `meta.code` only for `USER_NOT_IN_IAM` |
+| 403    | `itemType` missing or empty                                                                                  | `{ "error": "Authorization Failed. Incorrect config or invalid id was provided" }`   | not returned                           |
+| 403    | Caller lacks `list` on `data_view`                                                                           | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                           |
+| 400    | Query shape invalid (non-numeric `version`/`depth`/`page`/`limit`, `page` < 1, `limit` > 100)                | single issue message, or `Schema validation error` for several                       | `details[].code` (§11.2)               |
+| 500    | Query failed (non-uuid `id`/`createdBy`/`modifiedBy`, unconvertible `enabled`/`isDeleted`, negative `limit`) | `Failed to fetch config items by columns`                                            | not returned                           |
+
+**Example**
+
+```bash
+curl -G "https://pivotly.example.com/api/v3/config-items" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  --data-urlencode "itemType=data_view" \
+  --data-urlencode "enabled=true" \
+  --data-urlencode "limit=50"
+```
+
+**Notes:** read-only; no side effects. Use §8.4 for search, sorting and paging.
+
+### 8.2 Get a data view by slug — GET /v3/config-items/data_view/by-slug/{slug}
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `view`), 403 body shape; §4.
+- **Check order:** `[REST]` params → `[authz]`.
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                                                                           |
+| ------ | ------ | ---- | --------------------------------------------------------------------------------------------------------- |
+| `slug` | string | !    | Length ≥ 1 `[REST]`; no pattern enforced — any non-empty value is looked up; exact, case-sensitive match. |
+
+**Success — 200**: `data` is one config item read record — `id` (uuid), `itemType` (`data_view`), `isDeleted` (boolean, `false`), `version` (integer), `enabled` (boolean), `parentItemId` (always `null`), `name` (string), `description` (string \| null), `slug` (string), `fullPath` (string), `depth` (integer), `cfgData` (object), `createdAt` / `modifiedAt` (ISO timestamp), `createdBy` / `modifiedBy` (uuid \| null), `createdByIdentity` / `modifiedByIdentity` (string \| null), `deletedAt` (null). `message` = `Config item retrieved successfully`.
+
+```json
+{
+  "data": {
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "itemType": "data_view",
+    "isDeleted": false,
+    "version": 3,
+    "enabled": true,
+    "parentItemId": null,
+    "name": "Open orders",
+    "description": "Open orders filtered by status",
+    "slug": "dvw-open-orders",
+    "fullPath": "dvw-open-orders",
+    "depth": 1,
+    "cfgData": {
+      "authoring_mode": "direct_sql",
+      "implementation": "function",
+      "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+      "parameters": [{ "name": "p_status", "type": "text", "required": false }]
+    },
+    "createdAt": "2026-09-20T02:11:05.120Z",
+    "createdBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "createdByIdentity": "Jordan Lee",
+    "modifiedAt": "2026-09-27T08:40:12.004Z",
+    "modifiedBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "modifiedByIdentity": "Jordan Lee",
+    "deletedAt": null
+  },
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "Config item retrieved successfully"
+}
+```
+
+**Errors**
+
+| Status | Trigger                                                                                                     | `message` / body                                                                     | Code location                  |
+| ------ | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------ |
+| 400    | `slug` empty                                                                                                | `Slug is required`                                                                   | `details[].code` = `too_small` |
+| 401    | §3                                                                                                          | per §3                                                                               | —                              |
+| 403    | Caller lacks `view` on `data_view`                                                                          | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                   |
+| 404    | No config item has this slug with `item_type = data_view` (including when the slug belongs to another type) | `data_view with slug "<slug>" not found`                                             | not returned                   |
+| 500    | Lookup failed                                                                                               | `Failed to fetch config item by slug`                                                | not returned                   |
+
+**Example**
+
+```bash
+curl "https://pivotly.example.com/api/v3/config-items/data_view/by-slug/dvw-open-orders" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+**Notes:** returns the **stored** (authored) item, not the published snapshot — use §10.1 for what is published. Also returns soft-deleted (disabled) items (§8.7).
+
+### 8.3 Get a data view by id — GET /v3/config-items/data_view/{id}
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `view`), 403 body shape; §4.
+- **Check order:** `[REST]` params → `[authz]`.
+
+**Path parameters**
+
+| Param | Type   | Req. | Bounds / format                                                                                                           |
+| ----- | ------ | ---- | ------------------------------------------------------------------------------------------------------------------------- |
+| `id`  | string | !    | Length ≥ 1 `[REST]`; no uuid check at the request layer — a value that is not a full uuid makes the lookup fail with 500. |
+
+**Success — 200**: `data` is one config item read record — `id` (uuid), `itemType` (`data_view`), `isDeleted` (boolean, `false`), `version` (integer), `enabled` (boolean), `parentItemId` (always `null`), `name` (string), `description` (string \| null), `slug` (string), `fullPath` (string), `depth` (integer), `cfgData` (object), `createdAt` / `modifiedAt` (ISO timestamp), `createdBy` / `modifiedBy` (uuid \| null), `createdByIdentity` / `modifiedByIdentity` (string \| null), `deletedAt` (null). No `message`.
+
+```json
+{
+  "data": {
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "itemType": "data_view",
+    "isDeleted": false,
+    "version": 3,
+    "enabled": true,
+    "parentItemId": null,
+    "name": "Open orders",
+    "description": "Open orders filtered by status",
+    "slug": "dvw-open-orders",
+    "fullPath": "dvw-open-orders",
+    "depth": 1,
+    "cfgData": {
+      "authoring_mode": "direct_sql",
+      "implementation": "function",
+      "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+      "parameters": [{ "name": "p_status", "type": "text", "required": false }]
+    },
+    "createdAt": "2026-09-20T02:11:05.120Z",
+    "createdBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "createdByIdentity": "Jordan Lee",
+    "modifiedAt": "2026-09-27T08:40:12.004Z",
+    "modifiedBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "modifiedByIdentity": "Jordan Lee",
+    "deletedAt": null
+  },
+  "meta": {},
+  "status": 200,
+  "error": false
+}
+```
+
+**Errors**
+
+| Status | Trigger                                   | `message` / body                                                                     | Code location                  |
+| ------ | ----------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------ |
+| 400    | `id` empty                                | `ID is required`                                                                     | `details[].code` = `too_small` |
+| 401    | §3                                        | per §3                                                                               | —                              |
+| 403    | Caller lacks `view` on `data_view`        | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                   |
+| 404    | No item with this id                      | `Config item not found`                                                              | not returned                   |
+| 404    | The id belongs to an item of another type | `Config item type mismatch: expected data_view, got <type> not found`                | not returned                   |
+| 500    | `id` not a uuid, or lookup failed         | `Failed to fetch config item`                                                        | not returned                   |
+
+**Example**
+
+```bash
+curl "https://pivotly.example.com/api/v3/config-items/data_view/3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+### 8.4 List data views (paginated) — GET /v3/config-items/data_view
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `list`), 403 body shape; §4; §5 pagination/sort/filter conventions (page-size bounds 1–100 here).
+- **Check order:** `[REST]` query → `[authz]`.
+
+**Query parameters**
+
+| Param          | Type              | Req. | Bounds / format       | Default                | Notes                                                                                                                                                                                                                                                                                                                |
+| -------------- | ----------------- | ---- | --------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fetchType`    | string            | ?    | `list` \| `paginated` | `paginated`            | `list` returns **every** matching row; `page` / `pageSize` are then ignored and returned as `null`.                                                                                                                                                                                                                  |
+| `page`         | integer (coerced) | ?    | ≥ 0                   | `0`                    | Zero-based.                                                                                                                                                                                                                                                                                                          |
+| `pageSize`     | integer (coerced) | ?    | 1–100                 | `25`                   |                                                                                                                                                                                                                                                                                                                      |
+| `slugContains` | string            | ?    | None enforced         | —                      | Case-insensitive substring match on `slug`. `%` and `_` in the value act as wildcards.                                                                                                                                                                                                                               |
+| `search`       | string            | ?    | None enforced         | —                      | Case-insensitive substring match on `name` **or** `slug`; `%` / `_` act as wildcards.                                                                                                                                                                                                                                |
+| `sortModel`    | string (JSON)     | ?    | §5                    | `createdAt` descending | Sortable fields: every read-record key — `id`, `itemType`, `isDeleted`, `version`, `enabled`, `parentItemId`, `name`, `description`, `slug`, `fullPath`, `depth`, `cfgData`, `createdAt`, `createdBy`, `createdByIdentity`, `modifiedAt`, `modifiedBy`, `modifiedByIdentity`, `deletedAt`. Other fields are ignored. |
+| `filterModel`  | string (JSON)     | ?    | §5                    | —                      | Filterable fields: the same read-record keys. Quick-filter fields: `name`, `slug`, `description`, `fullPath`. Filters are AND-combined with the path type, so results are always `data_view` items.                                                                                                                  |
+
+Unknown query parameters are stripped.
+
+**Success — 200**: `data` is an array of config item read records — each `id` (uuid), `itemType` (`data_view`), `isDeleted` (boolean, `false`), `version` (integer), `enabled` (boolean), `parentItemId` (always `null`), `name` (string), `description` (string \| null), `slug` (string), `fullPath` (string), `depth` (integer), `cfgData` (object), `createdAt` / `modifiedAt` (ISO timestamp), `createdBy` / `modifiedBy` (uuid \| null), `createdByIdentity` / `modifiedByIdentity` (string \| null), `deletedAt` (null). `pagination` = `{ page, page_size, total_records }`. No `message`.
+
+```json
+{
+  "data": [
+    {
+      "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+      "itemType": "data_view",
+      "isDeleted": false,
+      "version": 3,
+      "enabled": true,
+      "parentItemId": null,
+      "name": "Open orders",
+      "description": "Open orders filtered by status",
+      "slug": "dvw-open-orders",
+      "fullPath": "dvw-open-orders",
+      "depth": 1,
+      "cfgData": {
+        "authoring_mode": "direct_sql",
+        "implementation": "function",
+        "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+        "parameters": [
+          { "name": "p_status", "type": "text", "required": false }
+        ]
+      },
+      "createdAt": "2026-09-20T02:11:05.120Z",
+      "createdBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+      "createdByIdentity": "Jordan Lee",
+      "modifiedAt": "2026-09-27T08:40:12.004Z",
+      "modifiedBy": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+      "modifiedByIdentity": "Jordan Lee",
+      "deletedAt": null
+    }
+  ],
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "pagination": { "page": 0, "page_size": 25, "total_records": 1 }
+}
+```
+
+**Errors**
+
+| Status | Trigger                                                              | `message` / body                                                                     | Code location            |
+| ------ | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------ |
+| 400    | Invalid `fetchType`, non-numeric or out-of-range `page` / `pageSize` | issue message or `Schema validation error`                                           | `details[].code` (§11.2) |
+| 401    | §3                                                                   | per §3                                                                               | —                        |
+| 403    | Caller lacks `list` on `data_view`                                   | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned             |
+| 500    | Query failed (e.g. a filter value the field's type cannot accept)    | `Failed to fetch config items`                                                       | not returned             |
+
+Malformed `sortModel` / `filterModel` JSON is **not** an error — it is ignored (§5).
+
+**Example**
+
+```bash
+curl -G "https://pivotly.example.com/api/v3/config-items/data_view" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  --data-urlencode "page=0" --data-urlencode "pageSize=25" \
+  --data-urlencode 'sortModel=[{"field":"modifiedAt","sort":"desc"}]' \
+  --data-urlencode 'filterModel={"items":[{"field":"enabled","operator":"is","value":true}],"quickFilterValues":["orders"]}'
+```
+
+### 8.5 Create a data view — POST /v3/config-items/data_view
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `Content-Type: application/json` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `create`), 403 body shape; §4; §6 (every item-envelope and `cfg_data` rule); §7 slug pattern, reserved prefixes, enumerations; §11 (save failures surface as 500).
+- **Check order:** `[REST]` body → `[authz]` → `[service]` type match → `[service]` no id → `[save-fn]` slug availability → `[save-fn]` defaults → `[DB-validator]` → `[DB-constraint]` → stored.
+
+**Request body**
+
+```json
+{
+  "parameters": {},
+  "data": {
+    "slug": "string",
+    "item_type": "data_view",
+    "name": "string",
+    "description": "string | null",
+    "enabled": true,
+    "full_path": "string",
+    "parent_item_id": "uuid",
+    "cfg_data": {}
+  }
+}
+```
+
+| Field                  | Type            | Req.           | Default                        | Combined rule (exact)                                                                                                                                                                                                                                                     | Layer / stage                                                                                                                                 | Description                                         |
+| ---------------------- | --------------- | -------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `parameters`           | object          | ?              | —                              | Object if present. Its only recognized key is `id`, which is **forbidden** here; other keys are stripped.                                                                                                                                                                 | `[REST]`, `[service]`                                                                                                                         | Operation parameters.                               |
+| `parameters.id`        | string (uuid)   | must be absent | —                              | Present → 400 `ID should not be provided for creation. Use PATCH for updates.`                                                                                                                                                                                            | `[service]`                                                                                                                                   | —                                                   |
+| `data`                 | object          | !              | —                              | Object.                                                                                                                                                                                                                                                                   | `[REST]`                                                                                                                                      | The item.                                           |
+| `data.slug`            | string          | !              | —                              | 1–128 chars; `^[a-z][a-z0-9_-]{0,127}$`; not starting `sys_`, `dtm_`, `dtm-`, `dtv_`, `dtv-`; unused by **any** config item of any type. `[REST]` accepts up to 255 chars, so 129–255 chars passes the request layer and is rejected at save (500, `VALUE`); > 255 → 400. | `[REST]` 1–255; `[save-fn]` uniqueness; `[DB-validator]` `VALUE`, `RESERVED_PREFIX_SYS`, `RESERVED_PREFIX_DTM_DTV`; `[DB-constraint]` pattern | Globally unique identifier; immutable after create. |
+| `data.item_type`       | string          | !              | —                              | Exactly `data_view` (must equal the path segment); `[REST]` 1–100 chars.                                                                                                                                                                                                  | `[REST]`, `[service]`                                                                                                                         |                                                     |
+| `data.cfg_data`        | object          | !              | —                              | JSON object (arrays rejected at `[REST]`). All §6.2–§6.6 save rules apply. `{}` is accepted (an empty data view saves but cannot be published).                                                                                                                           | `[REST]`, `[DB-validator]`                                                                                                                    | The data-view definition; stored exactly as sent.   |
+| `data.name`            | string          | ?              | the slug (when absent or `""`) | ≤ 255 chars; `null` rejected (400). Not trimmed on create: a whitespace-only value is stored as sent.                                                                                                                                                                     | `[REST]`; `[save-fn]` default; `[DB-validator]` `REQUIRED` (never fires on create because of the default)                                     | Display name.                                       |
+| `data.description`     | string \| null  | ?              | `null`                         | ≤ 1000 chars. No format. Stored as sent (`""` stays `""`).                                                                                                                                                                                                                | `[REST]`                                                                                                                                      |                                                     |
+| `data.enabled`         | boolean \| null | ?              | `true` (also when `null`)      | Boolean.                                                                                                                                                                                                                                                                  | `[REST]`; `[save-fn]` default                                                                                                                 |                                                     |
+| `data.full_path`       | string          | ?              | the slug (when absent or `""`) | ≤ 500 chars; `null` rejected (400). No format enforced. Not trimmed on create.                                                                                                                                                                                            | `[REST]`; `[save-fn]` default                                                                                                                 | Hierarchy path; drives `depth`.                     |
+| `data.parent_item_id`  | string (uuid)   | ?              | `null`                         | `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` (case-insensitive); `null` rejected (400). Referenced item's existence is **not checked**.                                                                                                               | `[REST]`                                                                                                                                      |                                                     |
+| `data.version`         | integer         | ? — ignored    | 1                              | Positive integer if sent (else 400); the value is ignored.                                                                                                                                                                                                                | `[REST]`                                                                                                                                      | Server-set.                                         |
+| `data.id`              | string (uuid)   | must be absent | —                              | Present → 400 (as `parameters.id`).                                                                                                                                                                                                                                       | `[service]`                                                                                                                                   | Server-generated.                                   |
+| any other `data.*` key | —               | —              | —                              | Stripped (e.g. `is_deleted`).                                                                                                                                                                                                                                             | `[REST]`                                                                                                                                      |                                                     |
+
+**Effective request contract**
+
+- **Required to send:** `data.slug`, `data.item_type` (= `data_view`), `data.cfg_data` (object).
+- **Optional / defaulted (defaults are applied before the validator runs):** `data.name` → slug; `data.full_path` → slug; `data.enabled` → `true`; `data.description` → `null`; `data.parent_item_id` → `null`; `parameters` → `{}`. `name` is required by the validator but is effectively optional because of this default.
+- **Ignored / server-set:** `id` (generated; sending it is an error), `version` (set to 1), `is_deleted` (stripped; stored `false`), `created_at` / `created_by` / `modified_at` / `modified_by` (the caller), `depth` (computed).
+- **To be publishable** `cfg_data` must additionally satisfy §6.8 (at minimum `authoring_mode` plus its body).
+
+**Signature**
+
+`create(data{ slug!, item_type!("data_view"), cfg_data!(object) ; name?, description?, enabled?, full_path?, parent_item_id? } ; parameters?{}) — id forbidden/server-set, version ignored (=1)`
+
+**Validation rules** (all are defined in §6.1–§6.6; listed here with their stage)
+
+1. `[REST]` body shape and bounds (400).
+2. `[service]` `data.item_type` equals `data_view` (400); no `data.id` / `parameters.id` (400).
+3. `[save-fn]` slug availability: if any config item already has `data.slug` → 500 (two messages, see errors).
+4. `[DB-validator]` (all failures collected into one 500 `Validation failed` response with `details[]`): `REQUIRED` (`$.slug`, `$.item_type`, `$.name`), `VALUE` (`$.slug` pattern/length; `$.cfg_data.authoring_mode`; `$.cfg_data.implementation`), `RESERVED_PREFIX_SYS`, `RESERVED_PREFIX_DTM_DTV`, `TYPE` (`$.cfg_data` not an object; `$.cfg_data.parameters` not an array), `INVALID_DATA_VIEW_AREA`, `SLUG_DENORM_MATCH`, `AUTHORING_MODE_REQUIRES_BODY`, `INVALID_SQL_DDL_KEYWORD`, `INVALID_SQL_BASE_TABLE_REFERENCE`, `INVALID_SOURCE_DOMAIN`, `INVALID_FILTER_OP`, `INVALID_PARAMETER_NAME_PREFIX`, `INVALID_PARAMETER_TYPE`, `DUPLICATE_PARAMETER_NAME`, `DUPLICATE_COLUMN_NAME`, and — when a completed publication already exists for this slug (possible after a previous item with the slug existed) — `IMMUTABLE_SLUG_DENORM`, `IMMUTABLE_IMPLEMENTATION`. When `cfg_data` is not an object, only the envelope checks and `TYPE` run.
+5. `[DB-constraint]` slug pattern (backstop; the validator rejects first).
+
+**Success — 201**
+
+```json
+{
+  "data": {
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "item_type": "data_view",
+    "is_deleted": false,
+    "deleted_at": null,
+    "version": 1,
+    "enabled": true,
+    "parent_item_id": null,
+    "name": "Open orders",
+    "description": "Open orders filtered by status",
+    "slug": "dvw-open-orders",
+    "full_path": "dvw-open-orders",
+    "depth": 1,
+    "cfg_data": {
+      "authoring_mode": "direct_sql",
+      "implementation": "function",
+      "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+      "parameters": [{ "name": "p_status", "type": "text", "required": false }]
+    },
+    "created_at": "2026-09-28T01:15:22.310412+00:00",
+    "created_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "modified_at": "2026-09-28T01:15:22.310412+00:00",
+    "modified_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c"
+  },
+  "meta": {
+    "action": "insert",
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "slug": "dvw-open-orders",
+    "version": 1,
+    "item_type": "data_view"
+  },
+  "status": 201,
+  "error": false,
+  "message": "success"
+}
+```
+
+`data` is the save response row: `id` (uuid), `item_type`, `is_deleted` (boolean), `deleted_at` (null), `version` (integer), `enabled` (boolean), `parent_item_id` (uuid \| null), `name`, `description` (string \| null), `slug`, `full_path`, `depth` (integer), `cfg_data` (object), `created_at`, `created_by` (uuid \| null), `modified_at`, `modified_by` (uuid \| null). `meta` = `{ action: "insert", id, slug, version, item_type }`.
+
+**Errors**
+
+| Status | Trigger                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `message`                                                                                                  | Code location                                                       |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| 400    | Request shape: `data` missing/not an object; `slug` empty (`Slug is required`), missing or not a string (`invalid_type`, the validator's default "Invalid input: expected string…" text) or > 255 (`Slug must be less than 255 characters`); `item_type` empty (`Item type is required`), missing or not a string (`invalid_type`) or > 100 (`Item type must be less than 100 characters`); `cfg_data` missing or not an object; `name` > 255 (`Name must be less than 255 characters`) or `null`; `description` > 1000 (`Description must be less than 1000 characters`); `full_path` > 500 (`Full path must be less than 500 characters`) or `null`; `id` / `parent_item_id` not a uuid (`Invalid UUID format`); `version` not a positive integer; `enabled` not boolean/null | single issue message, or `Schema validation error` for several                                             | `details[].code` (§11.2)                                            |
+| 400    | Malformed JSON body                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | the JSON parser's text                                                                                     | no `details`                                                        |
+| 400    | `data.item_type` ≠ `data_view`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `Item type mismatch: URL specifies "data_view" but body specifies "<item_type>".`                          | not returned                                                        |
+| 400    | `data.id` or `parameters.id` present                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `ID should not be provided for creation. Use PATCH for updates.`                                           | not returned                                                        |
+| 401    | §3                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | per §3                                                                                                     | —                                                                   |
+| 403    | Caller lacks `create` on `data_view`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `{ "error": "Authorization failed. You don't have access to perform this action." }`                       | not returned                                                        |
+| 500    | Slug already used by another **data view**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | message states the slug already exists and that updating requires the existing item's id (which it quotes) | not returned; `meta` = `{ action, id, slug, item_type }`            |
+| 500    | Slug already used by an item of **another type**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | `Slug "<slug>" already exists with item_type "<type>"; cannot save as "data_view".`                        | not returned; `meta` as above                                       |
+| 500    | Data-view validation failed (rule list above)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | `Validation failed`                                                                                        | `details[].code` — one entry per violation (§11.3); `meta` as above |
+
+**Example**
+
+```bash
+curl -X POST "https://pivotly.example.com/api/v3/config-items/data_view" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "data": {
+      "slug": "dvw-open-orders",
+      "item_type": "data_view",
+      "name": "Open orders",
+      "description": "Open orders filtered by status",
+      "cfg_data": {
+        "authoring_mode": "direct_sql",
+        "implementation": "function",
+        "direct_sql": "SELECT o.id, o.order_no, o.status FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+        "parameters": [ { "name": "p_status", "type": "text", "required": false } ]
+      }
+    }
+  }'
+```
+
+**Notes:** saving never compiles or runs the query — call §9.1 to publish. Not idempotent: repeating the call fails on the second attempt (slug taken).
+
+### 8.6 Update a data view — PATCH /v3/config-items/data_view/{id}
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `Content-Type: application/json` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `change`), 403 body shape; §4; §6 (every rule, including §6.7 immutability once published); §7; §11.
+- **Check order:** `[REST]` body + path → `[authz]` → `[service]` type match → `[service]` id match → `[save-fn]` load by id, patch-merge, immutability → `[DB-validator]` → `[DB-constraint]` → stored.
+
+**Path parameters**
+
+| Param | Type   | Req. | Bounds / format                                                                                                              |
+| ----- | ------ | ---- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `id`  | string | !    | Length ≥ 1 `[REST]`. Must be a full uuid: any other value makes the request fail with 500 (generic `Internal server error`). |
+
+**Request body** — the update route validates the **same body shape as create**: `slug`, `item_type` and `cfg_data` are required on every update.
+
+```json
+{
+  "parameters": { "id": "uuid (optional, must equal the path id)" },
+  "data": {
+    "id": "uuid (optional, must equal the path id)",
+    "slug": "string (the current slug)",
+    "item_type": "data_view",
+    "cfg_data": {},
+    "name": "string",
+    "description": "string | null",
+    "enabled": true,
+    "full_path": "string",
+    "parent_item_id": "uuid"
+  }
+}
+```
+
+| Field                  | Type            | Req.        | Omitted →           | Combined rule (exact)                                                                                                                                                                                                                                | Layer / stage                                     |
+| ---------------------- | --------------- | ----------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `parameters`           | object          | ?           | —                   | Only `id` recognized; other keys stripped.                                                                                                                                                                                                           | `[REST]`                                          |
+| `parameters.id`        | string (uuid)   | ?           | —                   | Uuid format; if present must equal path `id` (else 400 `ID mismatch between URL and body.`).                                                                                                                                                         | `[REST]`, `[service]`                             |
+| `data`                 | object          | !           | —                   | Object.                                                                                                                                                                                                                                              | `[REST]`                                          |
+| `data.id`              | string (uuid)   | ?           | —                   | As `parameters.id`.                                                                                                                                                                                                                                  | `[REST]`, `[service]`                             |
+| `data.slug`            | string          | !           | (cannot be omitted) | 1–255 chars `[REST]`; after trimming surrounding whitespace it must **equal the stored slug** — a different value → 500 `Slug mismatch for id <id> (existing="<stored>", provided="<sent>")`. All §6.1 slug rules still apply to the resolved value. | `[REST]`, `[save-fn]` immutable, `[DB-validator]` |
+| `data.item_type`       | string          | !           | (cannot be omitted) | Exactly `data_view` (= path; 400 otherwise); must equal the stored type (500 `Item type conflict for slug "<slug>" (existing="<type>", provided="data_view")` when the id belongs to another type).                                                  | `[REST]`, `[service]`, `[save-fn]`                |
+| `data.cfg_data`        | object          | !           | (cannot be omitted) | JSON object; **replaces the stored `cfg_data` wholesale** (no key-level merge). Must be the complete, valid definition. All §6.2–§6.7 save rules apply.                                                                                              | `[REST]`, `[save-fn]`, `[DB-validator]`           |
+| `data.name`            | string          | ?           | keeps stored value  | ≤ 255 chars; `null` → 400. Trimmed; an empty or whitespace-only value becomes empty and is rejected (500, `REQUIRED` on `$.name`).                                                                                                                   | `[REST]`, `[save-fn]`, `[DB-validator]`           |
+| `data.description`     | string \| null  | ?           | keeps stored value  | ≤ 1000 chars. Trimmed; `null`, `""` or whitespace-only clears it to `null`.                                                                                                                                                                          | `[REST]`, `[save-fn]`                             |
+| `data.enabled`         | boolean \| null | ?           | keeps stored value  | Boolean. `null` → 500 (storage not-null violation).                                                                                                                                                                                                  | `[REST]`, `[DB-constraint]`                       |
+| `data.full_path`       | string          | ?           | keeps stored value  | ≤ 500 chars; `null` → 400. Trimmed; `""` or whitespace-only → 500 (storage not-null violation). No format.                                                                                                                                           | `[REST]`, `[DB-constraint]`                       |
+| `data.parent_item_id`  | string (uuid)   | ?           | keeps stored value  | Uuid pattern as in §8.5; `null` → 400, so it cannot be cleared through this endpoint. Existence not checked.                                                                                                                                         | `[REST]`                                          |
+| `data.version`         | integer         | ? — ignored | —                   | Positive integer if sent (else 400); ignored.                                                                                                                                                                                                        | `[REST]`                                          |
+| any other `data.*` key | —               | —           | —                   | Stripped.                                                                                                                                                                                                                                            | `[REST]`                                          |
+
+**Effective request contract (update)**
+
+- **Required to send:** path `id` (uuid); `data.slug` — the **current** slug; `data.item_type` = `data_view`; `data.cfg_data` — the **complete** definition. The request layer requires these three body fields on every update, even though the platform would otherwise keep stored values: **update is a full resubmission of `slug`, `item_type` and `cfg_data`, targeted by the path id.** To change only `name`, re-send the stored `slug`, `item_type` and `cfg_data` unchanged together with the new `name`.
+- **Optional (patch-merged):** `name`, `description`, `enabled`, `full_path`, `parent_item_id` — omitted fields keep their stored values; present fields replace them (text values trimmed; see table for `null` / empty behaviour).
+- **Merge behaviour of JSON fields:** `cfg_data` is replaced wholesale — there is no "omit to keep stored" and no key-level merge.
+- **Concurrency:** none. A sent `version` is ignored; every successful update increments the stored version by 1 (last write wins; no optimistic-lock check).
+- **Immutability:** `slug` and `item_type` can never change. Once published, `cfg_data.implementation` cannot be set to anything other than `function`, and a non-empty `cfg_data.slug` must equal the item slug (§6.7).
+- **Unknown id:** if no config item has the path `id`, the platform **creates** a new data view with that id instead of failing (the response then has `meta.action = "insert"`, `version` 1, status 200). Create rules apply (the slug must be unused; `name` / `full_path` default to the slug; `enabled` defaults to `true`). Check existence with §8.3 first if an update-only behaviour is needed.
+- **Side effects:** the item's soft-delete state is reset to not-deleted on every update (it is never set by this API — §8.7). A published data view keeps running its published definition until §9.1 is called again.
+- **Ignored / server-set:** `version`, `modified_at`, `modified_by`, `depth`, unknown keys.
+
+**Signature**
+
+`update(path id!(uuid) ; data{ slug!(current, immutable), item_type!("data_view", immutable), cfg_data!(complete, whole-replace) ; name?, description?, enabled?(not null), full_path?(not empty), parent_item_id?, id?(=path) } ; parameters?{ id?(=path) }) — version ignored/auto-increment, no optimistic lock, unknown id creates`
+
+**Validation rules**
+
+1. `[REST]` body shape and bounds, identical to create (400).
+2. `[service]` `data.item_type` = `data_view` (400); `parameters.id` / `data.id`, when present, equal the path id (400).
+3. `[save-fn]` load by id; `item_type` unchanged (500); `slug` unchanged (500).
+4. `[DB-validator]` every rule listed in §8.5 rule 4, on the merged record (500 `Validation failed` with `details[]`), including `IMMUTABLE_IMPLEMENTATION` / `IMMUTABLE_SLUG_DENORM` when a completed publication exists.
+5. `[DB-constraint]` `enabled` not null; `full_path` not empty (500).
+
+**Success — 200**
+
+```json
+{
+  "data": {
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "item_type": "data_view",
+    "is_deleted": false,
+    "deleted_at": null,
+    "version": 2,
+    "enabled": true,
+    "parent_item_id": null,
+    "name": "Open orders by status",
+    "description": "Open orders filtered by status",
+    "slug": "dvw-open-orders",
+    "full_path": "dvw-open-orders",
+    "depth": 1,
+    "cfg_data": {
+      "authoring_mode": "direct_sql",
+      "implementation": "function",
+      "direct_sql": "SELECT o.id, o.order_no, o.status, o.created_at FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+      "parameters": [{ "name": "p_status", "type": "text", "required": false }]
+    },
+    "created_at": "2026-09-28T01:15:22.310412+00:00",
+    "created_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "modified_at": "2026-09-28T02:03:41.902118+00:00",
+    "modified_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c"
+  },
+  "meta": {
+    "action": "update",
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "slug": "dvw-open-orders",
+    "version": 2,
+    "item_type": "data_view"
+  },
+  "status": 200,
+  "error": false,
+  "message": "success"
+}
+```
+
+`data` is the save response row: `id` (uuid), `item_type`, `is_deleted` (boolean), `deleted_at` (null), `version` (integer), `enabled` (boolean), `parent_item_id` (uuid \| null), `name`, `description` (string \| null), `slug`, `full_path`, `depth` (integer), `cfg_data` (object), `created_at`, `created_by` (uuid \| null), `modified_at`, `modified_by` (uuid \| null). `meta` = `{ action: "update" | "insert", id, slug, version, item_type }`.
+
+**Errors**
+
+| Status | Trigger                                                                                                                                                    | `message`                                                                                   | Code location                                            |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| 400    | Request shape — every create-body failure listed in §8.5 (missing `slug` / `item_type` / `cfg_data` included), or `id` path param empty (`ID is required`) | issue message or `Schema validation error`                                                  | `details[].code` (§11.2)                                 |
+| 400    | `data.item_type` ≠ `data_view`                                                                                                                             | `Item type mismatch: URL specifies "data_view" but body specifies "<item_type>".`           | not returned                                             |
+| 400    | `parameters.id` or `data.id` ≠ path id                                                                                                                     | `ID mismatch between URL and body.`                                                         | not returned                                             |
+| 401    | §3                                                                                                                                                         | per §3                                                                                      | —                                                        |
+| 403    | Caller lacks `change` on `data_view`                                                                                                                       | `{ "error": "Authorization failed. You don't have access to perform this action." }`        | not returned                                             |
+| 500    | Path `id` is not a uuid                                                                                                                                    | `Internal server error` (production; development deployments return the underlying message) | not returned                                             |
+| 500    | Slug changed                                                                                                                                               | `Slug mismatch for id <id> (existing="<stored>", provided="<sent>")`                        | not returned; `meta` = `{ action, id, slug, item_type }` |
+| 500    | Id belongs to another item type                                                                                                                            | `Item type conflict for slug "<slug>" (existing="<type>", provided="data_view")`            | not returned; `meta` as above                            |
+| 500    | Data-view validation failed                                                                                                                                | `Validation failed`                                                                         | `details[].code` (§11.3); `meta` as above                |
+| 500    | `enabled: null`, or `full_path` empty                                                                                                                      | storage not-null violation message naming the column                                        | not returned; `meta` as above                            |
+| 500    | Unknown id and the slug is already used (the create path, §8.5)                                                                                            | the two slug-taken messages of §8.5                                                         | not returned; `meta` as above                            |
+
+**Example**
+
+```bash
+curl -X PATCH "https://pivotly.example.com/api/v3/config-items/data_view/3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "data": {
+      "slug": "dvw-open-orders",
+      "item_type": "data_view",
+      "name": "Open orders by status",
+      "cfg_data": {
+        "authoring_mode": "direct_sql",
+        "implementation": "function",
+        "direct_sql": "SELECT o.id, o.order_no, o.status, o.created_at FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+        "parameters": [ { "name": "p_status", "type": "text", "required": false } ]
+      }
+    }
+  }'
+```
+
+### 8.7 Soft-delete a data view — DELETE /v3/config-items/data_view/{id}
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `Content-Type: application/json` (! only when a body is sent), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `delete`), 403 body shape; §4; §6 (the validator re-runs on the resulting record); §11.
+- **Check order:** `[REST]` body + path → `[authz]` → `[service]` load existing (404) → `[save-fn]` update → `[DB-validator]` → `[DB-constraint]` → stored.
+
+> **What this endpoint actually does.** It saves the item again with `enabled = false`, incrementing its version. The item is **not** marked deleted: afterwards it still has `isDeleted: false`, `deletedAt: null`, still appears in §8.1–§8.4, can be updated (which does not re-enable it unless `enabled: true` is sent), and **can still be published** (§9.1). It does **not** unpublish: a published data view keeps running via §10.2. Call §9.2 (repeatedly — see there) to stop it being executable.
+
+**Path parameters**
+
+| Param | Type   | Req. | Bounds / format                                                           |
+| ----- | ------ | ---- | ------------------------------------------------------------------------- |
+| `id`  | string | !    | Length ≥ 1 `[REST]`. Not a full uuid → 500 `Failed to fetch config item`. |
+
+**Request body** — optional. Every field is optional; each is validated with the same per-field format rules as create.
+
+| Field                 | Type            | Req. | Behaviour when sent                                                         | Behaviour when omitted                      | Layer                      |
+| --------------------- | --------------- | ---- | --------------------------------------------------------------------------- | ------------------------------------------- | -------------------------- |
+| `parameters.id`       | string (uuid)   | ?    | Format-checked, then **ignored** (the path id is used)                      | —                                           | `[REST]`                   |
+| `data.id`             | string (uuid)   | ?    | Format-checked, then ignored                                                | —                                           | `[REST]`                   |
+| `data.slug`           | string          | ?    | 1–255 chars; must equal the stored slug (500 `Slug mismatch ...` otherwise) | stored slug is used                         | `[REST]`, `[save-fn]`      |
+| `data.item_type`      | string          | ?    | 1–100 chars; then **ignored** (the path type is used)                       | —                                           | `[REST]`                   |
+| `data.cfg_data`       | object          | ?    | Replaces the stored `cfg_data` wholesale and must pass validation           | stored `cfg_data` is re-submitted unchanged | `[REST]`, `[DB-validator]` |
+| `data.name`           | string          | ?    | As update (§8.6)                                                            | stored value kept                           | `[REST]`, `[save-fn]`      |
+| `data.description`    | string \| null  | ?    | As update                                                                   | stored value kept                           | `[REST]`, `[save-fn]`      |
+| `data.full_path`      | string          | ?    | As update                                                                   | stored value kept                           | `[REST]`, `[save-fn]`      |
+| `data.parent_item_id` | string (uuid)   | ?    | As update                                                                   | stored value kept                           | `[REST]`                   |
+| `data.enabled`        | boolean \| null | ?    | Format-checked, then **overridden** to `false`                              | —                                           | `[REST]`                   |
+| `data.version`        | integer         | ?    | Format-checked, then ignored                                                | —                                           | `[REST]`                   |
+
+**Effective request contract (soft-delete)**
+
+- **Required to send:** path `id` (uuid). No body is needed.
+- **Optional:** the body fields above. Sending anything other than nothing is rarely useful; `data.cfg_data` in particular overwrites the stored definition.
+- **Ignored / overridden:** `parameters.id`, `data.id`, `data.item_type`, `data.enabled` (forced `false`), `data.version`; the deleted flag the handler requests is ignored by the platform.
+- **Concurrency:** none; version auto-increments.
+- **Validation re-runs:** the stored (or sent) `cfg_data` is validated again, so a soft-delete can fail with `Validation failed` if the stored definition violates a current rule (for example `implementation: "view"` on a data view that has since been published).
+
+**Signature**
+
+`softDelete(path id!(uuid) ; body?{ data?{ slug?(=current), cfg_data?(whole-replace), name?, description?, full_path?, parent_item_id? } }) — sets enabled=false; version auto-increment; not marked deleted; does not unpublish; id/item_type/enabled/version in body ignored`
+
+**Success — 200**
+
+```json
+{
+  "data": {
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "item_type": "data_view",
+    "is_deleted": false,
+    "deleted_at": null,
+    "version": 3,
+    "enabled": false,
+    "parent_item_id": null,
+    "name": "Open orders by status",
+    "description": "Open orders filtered by status",
+    "slug": "dvw-open-orders",
+    "full_path": "dvw-open-orders",
+    "depth": 1,
+    "cfg_data": {
+      "authoring_mode": "direct_sql",
+      "implementation": "function",
+      "direct_sql": "SELECT o.id, o.order_no, o.status, o.created_at FROM usdf.orders o WHERE o.status = COALESCE(p_status, o.status)",
+      "parameters": [{ "name": "p_status", "type": "text", "required": false }]
+    },
+    "created_at": "2026-09-28T01:15:22.310412+00:00",
+    "created_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c",
+    "modified_at": "2026-09-28T03:30:05.441907+00:00",
+    "modified_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c"
+  },
+  "meta": {
+    "action": "update",
+    "id": "3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+    "slug": "dvw-open-orders",
+    "version": 3,
+    "item_type": "data_view"
+  },
+  "status": 200,
+  "error": false,
+  "message": "success"
+}
+```
+
+`data` is the save response row: `id` (uuid), `item_type`, `is_deleted` (boolean — `false`), `deleted_at` (null), `version` (integer), `enabled` (boolean — `false`), `parent_item_id` (uuid \| null), `name`, `description` (string \| null), `slug`, `full_path`, `depth` (integer), `cfg_data` (object), `created_at`, `created_by` (uuid \| null), `modified_at`, `modified_by` (uuid \| null). `meta` = `{ action: "update", id, slug, version, item_type }`.
+
+**Errors**
+
+| Status | Trigger                                                           | `message`                                                                            | Code location                                            |
+| ------ | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| 400    | Body field fails its format rule (as §8.5), `id` path param empty | issue message or `Schema validation error`                                           | `details[].code` (§11.2)                                 |
+| 400    | Malformed JSON body                                               | the JSON parser's text                                                               | no `details`                                             |
+| 401    | §3                                                                | per §3                                                                               | —                                                        |
+| 403    | Caller lacks `delete` on `data_view`                              | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                                             |
+| 404    | No item with this id                                              | `Config item not found`                                                              | not returned                                             |
+| 404    | Id belongs to another item type                                   | `Config item type mismatch: expected data_view, got <type> not found`                | not returned                                             |
+| 500    | `id` not a uuid                                                   | `Failed to fetch config item`                                                        | not returned                                             |
+| 500    | `data.slug` differs from stored slug                              | `Slug mismatch for id <id> (existing="<stored>", provided="<sent>")`                 | not returned; `meta` = `{ action, id, slug, item_type }` |
+| 500    | Validation of the resulting record failed                         | `Validation failed`                                                                  | `details[].code` (§11.3); `meta` as above                |
+| 500    | `data.full_path` empty                                            | storage not-null violation message naming the column                                 | not returned; `meta` as above                            |
+
+**Example**
+
+```bash
+curl -X DELETE "https://pivotly.example.com/api/v3/config-items/data_view/3f1c2d4e-5a6b-4c7d-8e9f-0a1b2c3d4e5f" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+## 9. Endpoint reference — Publish
+
+**Publication record.** Each successful publish appends one immutable publication record for the slug. Publication reads (§9.3, §9.4), the definition (§10.1) and execute (§10.2) use the **most recent** record with status `complete` and implementation `function` — which, because publish only ever records that combination, is simply the most recent publication. Fields exposed on the wire (restated per endpoint): `id` (uuid), `view_slug` (string), `status` (`not_started` \| `publishing` \| `complete`), `implementation` (`function` \| `view`), `parameter_signature` (string — the published inputs as comma-separated `<name> <type>` pairs, e.g. `p_status text`; empty string when there are none), `db_object_name` (string — server-generated name of the published function, derived from the slug per §7; treat as opaque), `published_at` (ISO timestamp), `published_by` (uuid \| null — the publishing user).
+
+### 9.1 Publish a data view — POST /v3/data-views/{slug}/publish
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `publish`), 403 body shape; §4; §6.3–§6.5 and §6.8 (publish-stage rules); §7 (object-name derivation and collisions); §11 (publish failures surface as 404/500).
+- **Check order:** `[REST]` path → `[authz]` → `[DB-publish]` checks (stop at the first failure) → compile → record.
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                                                                                                                                                                           |
+| ------ | ------ | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `slug` | string | !    | No length or pattern check at the request layer. Must be the slug of an existing data view (exact, case-sensitive). An empty value is rejected by the platform (500 `Missing required parameter: slug.`). |
+
+**Request body:** none. Any body is ignored (a body that is not valid JSON is still rejected with 400, §2).
+
+**Effective request contract**
+
+- **Required to send:** path `slug`.
+- **Publishes the stored definition:** publish reads the data view's **currently stored** `cfg_data` (§8.5/§8.6); there is nothing to send. The save-time validator is **not** re-run; the publish-stage checks below are.
+- **Not gated by `enabled`:** a soft-deleted (disabled) data view (§8.7) is still published.
+
+**Signature**
+
+`publish(path slug!) — no body; publishes stored cfg_data; appends a publication; replaces the published function`
+
+**Publish-stage rules, in the order they run** (first failure wins; all failures leave the previous publication and function untouched)
+
+| #   | Rule (exact)                                                                                                                                                                                                                                                                                | Result on failure                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `slug` non-empty                                                                                                                                                                                                                                                                            | 500 `Missing required parameter: slug.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 2   | A config item with this `slug` and `item_type = data_view` exists (and is not marked deleted — never the case via this API)                                                                                                                                                                 | **404** `Data view "<slug>" not found.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 3   | `slug` matches `^[a-z][a-z0-9_-]{0,127}$`                                                                                                                                                                                                                                                   | 500 `Use lowercase letters, digits, hyphens, or underscores; start with a letter.` (unreachable for items saved through §8.5)                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 4   | `implementation` (default `function`) is `function` or `view`                                                                                                                                                                                                                               | 500 `Invalid implementation "<value>". Must be "function" or "view".`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 5   | `authoring_mode` (default `direct_sql`) is `builder` or `direct_sql`                                                                                                                                                                                                                        | 500 `Invalid authoring_mode "<value>". Must be "builder" or "direct_sql".`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 6   | Effective mode `direct_sql` → `direct_sql` non-empty after trimming                                                                                                                                                                                                                         | 500 `authoring_mode is "direct_sql" but direct_sql is empty.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 7   | Effective mode `builder` → `builder.sources` present                                                                                                                                                                                                                                        | 500 `authoring_mode is "builder" but builder.sources is missing.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 8   | For each parameter, in order: `name` non-empty                                                                                                                                                                                                                                              | 500 `Parameter at index <n> has no name.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 9   | … `name` matches `^p_[a-z][a-z0-9_]*$`                                                                                                                                                                                                                                                      | 500 message quoting the name and the pattern                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 10  | … `type`, when present, in `text`, `integer`, `uuid`, `boolean`, `numeric`, `date`, `timestamptz`                                                                                                                                                                                           | 500 `Parameter "<name>" has invalid type "<type>". Valid: text, integer, uuid, boolean, numeric, date, timestamptz.`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 11  | For each parameter without a `default`, `required` (when present) can be read as a boolean                                                                                                                                                                                                  | 500; `message` = the underlying conversion error text (e.g. invalid boolean input); `meta` = `{ slug }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 12  | `authoring_mode = "direct_sql"` → no DDL/DML keyword (§6.3), checked keyword by keyword in the order listed in §7                                                                                                                                                                           | 500 `Remove the DDL/DML keyword or refactor as a parameterized SELECT.`; `meta` = `{ keyword, slug }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 13  | `authoring_mode = "direct_sql"` → no base/archive table reference (§6.3)                                                                                                                                                                                                                    | 500 `Replace usdf.clients_b with usdf.clients (etc.).`; `meta` = `{ slug }`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 14  | Builder with a primary source: every filter with a `column` has an `op` (absent/`null` → `equals`) in the builder filter set (§6.4)                                                                                                                                                         | 500 `Unsupported filter operator: "<op>"`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 15  | `${...}` tokens resolved (§6.3); the query compiles and its output columns can be determined (the query is run once with a zero-row limit for this); the function can be created (parameter ordering §6.5, parameter defaults convertible, SQL valid, referenced domains and columns exist) | 500, `meta` = `{ slug }`, with one of three `message` forms: (a) the query cannot be compiled or run for column discovery (syntax error, missing domain or column, bad builder identifiers): an internal step label followed by `column introspection failed for data view "<slug>" -- <reason>` — match on the text `column introspection failed`; (b) the query yields no output columns: `Cannot publish data view "<slug>": return column list could not be determined.`; (c) the function itself cannot be created (parameter ordering, unconvertible default): the underlying reason text only |
+
+**Effects of a successful publish**
+
+1. Every previously published function with the same derived name is dropped (whatever its parameter list) and the new function is created. Because the name is derived from the slug (§7), a data view whose slug derives the same name as another's **replaces that other data view's function**.
+2. A new publication record is appended (`status: complete`, `implementation: function`, the parameter signature, the object name, the caller as `published_by`). Earlier records are kept — see §9.2 for why that matters.
+3. The publication snapshot stores the published `cfg_data`; when `cfg_data.columns` is absent or empty, it is filled with the output columns discovered from the query (§6.6).
+4. Platform metadata about the published view (parameters, output columns, areas) is refreshed, and domains whose read views reference this data view are re-bound to the new publication. Both steps are best-effort: their failure does not fail the publish. Apart from the zero-row run used to discover columns (rule 15), publishing does not execute the query.
+
+**Success — 200**
+
+```json
+{
+  "data": {},
+  "meta": {
+    "slug": "dvw-open-orders",
+    "db_object_name": "usdf.dvw_open_orders",
+    "pub_id": "b7e4f0a2-9c1d-4e3f-8a5b-6c7d8e9f0a1b"
+  },
+  "status": 200,
+  "error": false,
+  "message": "Data view \"dvw-open-orders\" published as function usdf.dvw_open_orders."
+}
+```
+
+| Field                 | Type          | Notes                                                       |
+| --------------------- | ------------- | ----------------------------------------------------------- |
+| `data`                | object        | Always `{}`.                                                |
+| `meta.slug`           | string        | The published slug.                                         |
+| `meta.db_object_name` | string        | Server-generated name of the published function (opaque).   |
+| `meta.pub_id`         | string (uuid) | Id of the new publication record (appears as `id` in §9.4). |
+| `message`             | string        | States the slug and the published function name.            |
+
+**Errors**
+
+| Status | Trigger                               | `message`                                                                            | Code location                                            |
+| ------ | ------------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| 401    | §3                                    | per §3                                                                               | —                                                        |
+| 403    | Caller lacks `publish` on `data_view` | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                                             |
+| 404    | Rule 2                                | `Data view "<slug>" not found.`                                                      | not returned (`NOT_FOUND`)                               |
+| 500    | Rule 1                                | `Missing required parameter: slug.`                                                  | not returned (`MISSING_PARAM`)                           |
+| 500    | Rule 3                                | see table                                                                            | not returned (`INVALID_SLUG`); `meta.slug`               |
+| 500    | Rules 4–8, 10                         | see table                                                                            | not returned (`INVALID_CFG_DATA`)                        |
+| 500    | Rule 9                                | see table                                                                            | not returned (`INVALID_PARAMETER_NAME_PREFIX`)           |
+| 500    | Rule 12                               | see table                                                                            | not returned (`INVALID_SQL_DDL_KEYWORD`); `meta.keyword` |
+| 500    | Rule 13                               | see table                                                                            | not returned (`INVALID_SQL_BASE_TABLE_REFERENCE`)        |
+| 500    | Rule 14                               | see table                                                                            | not returned (`INVALID_FILTER_OP`)                       |
+| 500    | Rules 11, 15                          | see table                                                                            | not returned (`PUBLISH_FAILED`); `meta.slug`             |
+
+The codes in parentheses are the platform's internal labels for these conditions; they are **not** present in the response — distinguish conditions by `status` and `message`.
+
+**Example**
+
+```bash
+curl -X POST "https://pivotly.example.com/api/v3/data-views/dvw-open-orders/publish" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+**Notes:** not idempotent in its records — every call appends a publication record, even when nothing changed. Run the latest saved definition through publish before relying on edits: execute and definition always reflect the latest publication, not the stored item.
+
+### 9.2 Unpublish a data view — DELETE /v3/data-views/{slug}/unpublish
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `change`), 403 body shape; §4; §11.
+- **Check order:** `[REST]` path → `[authz]` → `[DB-publish]`.
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                                                                                                                                                        |
+| ------ | ------ | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `slug` | string | !    | No length or pattern check at the request layer; exact, case-sensitive. An empty value → 500 `Missing required parameter: slug.` The data view config item does **not** need to exist. |
+
+**Request body:** none. Any body is ignored (a body that is not valid JSON is still rejected with 400, §2).
+
+**Behaviour**
+
+1. Finds the **most recent** completed publication record for the slug. If there is none → success with `message` `Data view "<slug>" has no active publication.` and `meta` `{ slug }` (idempotent).
+2. Otherwise drops the published function matching that record's parameter signature (a drop failure is ignored), deletes **that one** publication record, and returns `message` `Data view "<slug>" unpublished.` with `meta` `{ slug, dropped: <db_object_name> }`.
+
+> **One call removes one publication record.** Every publish (§9.1) appends a record, and all records for a slug share one published function name. After an unpublish, the next-older record becomes the "latest": §9.3, §9.4 and §10.1 then report it, and §10.2 tries to run a function that has just been removed and fails with 500. To take a data view fully offline, **repeat this call until the message is `Data view "<slug>" has no active publication.`** Unpublishing does not modify or disable the config item.
+
+**Effective request contract**
+
+- **Required to send:** path `slug`. **Optional:** nothing. **Ignored:** any body.
+
+**Signature**
+
+`unpublish(path slug!) — no body; removes the latest publication record and its function; idempotent when none remain`
+
+**Success — 200**
+
+```json
+{
+  "data": {},
+  "meta": { "slug": "dvw-open-orders", "dropped": "usdf.dvw_open_orders" },
+  "status": 200,
+  "error": false,
+  "message": "Data view \"dvw-open-orders\" unpublished."
+}
+```
+
+| Field          | Type           | Notes                                                                                |
+| -------------- | -------------- | ------------------------------------------------------------------------------------ |
+| `data`         | object         | Always `{}`.                                                                         |
+| `meta.slug`    | string         | Always present.                                                                      |
+| `meta.dropped` | string \| null | Present only when a publication record was removed: the object name of that record.  |
+| `message`      | string         | `Data view "<slug>" unpublished.` or `Data view "<slug>" has no active publication.` |
+
+**Errors**
+
+| Status | Trigger                              | `message`                                                                            | Code location                                  |
+| ------ | ------------------------------------ | ------------------------------------------------------------------------------------ | ---------------------------------------------- |
+| 401    | §3                                   | per §3                                                                               | —                                              |
+| 403    | Caller lacks `change` on `data_view` | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned                                   |
+| 500    | Empty slug                           | `Missing required parameter: slug.`                                                  | not returned (`MISSING_PARAM`)                 |
+| 500    | Unexpected failure                   | underlying reason text                                                               | not returned (`UNPUBLISH_FAILED`); `meta.slug` |
+
+**Example**
+
+```bash
+curl -X DELETE "https://pivotly.example.com/api/v3/data-views/dvw-open-orders/unpublish" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+### 9.3 List published data views — GET /v3/data-views/publications
+
+- **Classification:** consumer.
+- **Purpose:** one row per slug that has a publication — its latest publication — enriched with the data view's name and description. Intended for pickers.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `view`), 403 body shape; §4; §5 (page-size bounds 1–500 here).
+- **Check order:** `[REST]` query → `[authz]`.
+
+**Query parameters**
+
+| Param          | Type              | Req. | Bounds / format | Default               | Notes                                                                                                                                                                                                                                                               |
+| -------------- | ----------------- | ---- | --------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `page`         | integer (coerced) | ?    | ≥ 0             | `0`                   | Zero-based.                                                                                                                                                                                                                                                         |
+| `pageSize`     | integer (coerced) | ?    | 1–500           | `20`                  |                                                                                                                                                                                                                                                                     |
+| `slugContains` | string            | ?    | None enforced   | —                     | Case-insensitive substring on `view_slug`; ignored when blank. `%` / `_` act as wildcards.                                                                                                                                                                          |
+| `search`       | string            | ?    | None enforced   | —                     | Trimmed; case-insensitive substring on `name` **or** `view_slug`; ignored when blank.                                                                                                                                                                               |
+| `sortModel`    | string (JSON)     | ?    | §5              | `view_slug` ascending | Sortable fields: `view_slug`, `name`, `published_at`, `published_by`, `db_object_name`. Others ignored.                                                                                                                                                             |
+| `filterModel`  | string (JSON)     | ?    | §5              | —                     | Filterable fields: `view_slug`, `name`, `published_at`, `published_by`, `db_object_name`; quick-filter fields: `view_slug`, `name`. Partial-uuid matching does **not** apply here: a comparison on `published_by` with a value that is not a full uuid fails (500). |
+
+Unknown query parameters are stripped.
+
+**Success — 200**
+
+```json
+{
+  "data": [
+    {
+      "view_slug": "dvw-open-orders",
+      "name": "Open orders by status",
+      "description": "Open orders filtered by status",
+      "parameter_signature": "p_status text",
+      "db_object_name": "usdf.dvw_open_orders",
+      "published_at": "2026-09-28T02:10:00.512Z",
+      "published_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c"
+    }
+  ],
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "Published data views retrieved",
+  "pagination": { "page": 0, "page_size": 20, "total_records": 1 }
+}
+```
+
+| Row field             | Type                   | Notes                                                                                    |
+| --------------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
+| `view_slug`           | string                 |                                                                                          |
+| `name`                | string \| null         | From the data view config item; `null` when no data view with this slug exists any more. |
+| `description`         | string \| null         | From the config item (outer `description`).                                              |
+| `parameter_signature` | string                 | Comma-separated `<name> <type>` pairs; `""` when none.                                   |
+| `db_object_name`      | string                 | Opaque.                                                                                  |
+| `published_at`        | string (ISO timestamp) |                                                                                          |
+| `published_by`        | string (uuid) \| null  |                                                                                          |
+
+**Errors**
+
+| Status | Trigger                                         | `message` / body                                                                     | Code location            |
+| ------ | ----------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------ |
+| 400    | Non-numeric or out-of-range `page` / `pageSize` | issue message or `Schema validation error`                                           | `details[].code` (§11.2) |
+| 401    | §3                                              | per §3                                                                               | —                        |
+| 403    | Caller lacks `view` on `data_view`              | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned             |
+| 500    | Query failed (e.g. unconvertible filter value)  | `Failed to fetch published data views`                                               | not returned             |
+
+**Example**
+
+```bash
+curl -G "https://pivotly.example.com/api/v3/data-views/publications" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  --data-urlencode "search=orders" --data-urlencode "pageSize=50"
+```
+
+**Notes:** a slug appears here as long as at least one publication record remains, even if its config item was soft-deleted (§8.7) or its function was removed by a partial unpublish (§9.2).
+
+### 9.4 Publication history of a data view — GET /v3/data-views/{slug}/publications
+
+- **Classification:** consumer.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `view`), 403 body shape; §4; §5 (page-size bounds 1–500 here).
+- **Check order:** `[REST]` path + query → `[authz]`.
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                                                                 |
+| ------ | ------ | ---- | ----------------------------------------------------------------------------------------------- |
+| `slug` | string | !    | No length or pattern check; exact, case-sensitive. An unknown slug returns an empty list (200). |
+
+**Query parameters**
+
+| Param         | Type              | Req. | Bounds / format | Default                   | Notes                                                                                                                                                                                                                                                                                                                                                                                               |
+| ------------- | ----------------- | ---- | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `page`        | integer (coerced) | ?    | ≥ 0             | `0`                       | Zero-based.                                                                                                                                                                                                                                                                                                                                                                                         |
+| `pageSize`    | integer (coerced) | ?    | 1–500           | `20`                      |                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `sortModel`   | string (JSON)     | ?    | §5              | `published_at` descending | Sortable fields: `status`, `implementation`, `published_at`, `published_by`, `parameter_signature`, `db_object_name`. Others ignored.                                                                                                                                                                                                                                                               |
+| `filterModel` | string (JSON)     | ?    | §5              | —                         | Filterable fields: the same six. Quick-filter fields: `status`, `implementation`, `db_object_name`, `parameter_signature`. On `status`, a comparison with a value outside `not_started`, `publishing`, `complete` fails (500), and the substring operators (`contains`, `doesNotContain`, `startsWith`, `endsWith`) always fail (500); on `published_by`, a partial uuid is matched as a substring. |
+
+Unknown query parameters (including `slugContains` and `search`) are stripped.
+
+**Success — 200**
+
+```json
+{
+  "data": [
+    {
+      "id": "b7e4f0a2-9c1d-4e3f-8a5b-6c7d8e9f0a1b",
+      "view_slug": "dvw-open-orders",
+      "status": "complete",
+      "implementation": "function",
+      "parameter_signature": "p_status text",
+      "db_object_name": "usdf.dvw_open_orders",
+      "published_at": "2026-09-28T02:10:00.512Z",
+      "published_by": "7d2b9a10-4c3e-4f5a-9b8c-1d2e3f4a5b6c"
+    }
+  ],
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "Publications retrieved",
+  "pagination": { "page": 0, "page_size": 20, "total_records": 1 }
+}
+```
+
+| Row field             | Type                   | Notes                                        |
+| --------------------- | ---------------------- | -------------------------------------------- |
+| `id`                  | string (uuid)          | Publication id (`meta.pub_id` of §9.1).      |
+| `view_slug`           | string                 |                                              |
+| `status`              | string                 | `not_started` \| `publishing` \| `complete`. |
+| `implementation`      | string                 | `function` \| `view`.                        |
+| `parameter_signature` | string                 |                                              |
+| `db_object_name`      | string                 | Opaque.                                      |
+| `published_at`        | string (ISO timestamp) |                                              |
+| `published_by`        | string (uuid) \| null  |                                              |
+
+**Errors**
+
+| Status | Trigger                                           | `message` / body                                                                     | Code location            |
+| ------ | ------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------ |
+| 400    | Non-numeric or out-of-range `page` / `pageSize`   | issue message or `Schema validation error`                                           | `details[].code` (§11.2) |
+| 401    | §3                                                | per §3                                                                               | —                        |
+| 403    | Caller lacks `view` on `data_view`                | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned             |
+| 500    | Query failed (e.g. invalid `status` filter value) | `Failed to fetch paginated publication history`                                      | not returned             |
+
+**Example**
+
+```bash
+curl -G "https://pivotly.example.com/api/v3/data-views/dvw-open-orders/publications" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  --data-urlencode 'sortModel=[{"field":"published_at","sort":"desc"}]'
+```
+
+## 10. Endpoint reference — Type-specific operations
+
+### 10.1 Get the published definition — GET /v3/data-views/{slug}/definition
+
+- **Classification:** consumer.
+- **Purpose:** the parameters and output columns of the **latest publication** (not of the stored item), for building parameter forms and column pickers.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `view`), 403 body shape; §4; §6.5–§6.6 (how parameters and columns are reported).
+- **Check order:** `[REST]` path → `[authz]` → `[service]` publication lookup.
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                    |
+| ------ | ------ | ---- | -------------------------------------------------- |
+| `slug` | string | !    | No length or pattern check; exact, case-sensitive. |
+
+**Success — 200**
+
+```json
+{
+  "data": {
+    "parameters": [{ "name": "p_status", "type": "text", "required": false }],
+    "columns": [
+      { "name": "id", "type": "uuid" },
+      { "name": "order_no", "type": "text" },
+      { "name": "status", "type": "text" },
+      { "name": "created_at", "type": "timestamp with time zone" }
+    ]
+  },
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "Data view definition retrieved"
+}
+```
+
+| Field                        | Type    | Req. in response                                                                 | Source / notes                                                                                                                                                                                                                                                     |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `data.parameters`            | array   | always                                                                           | The published `cfg_data.parameters`, in order (`[]` when none or not an array).                                                                                                                                                                                    |
+| `data.parameters[].name`     | string  | always                                                                           | `""` when the published entry had none.                                                                                                                                                                                                                            |
+| `data.parameters[].type`     | string  | always                                                                           | As authored; `""` when the entry had no `type` (the published function then uses the entry's `data_type` if present, otherwise `text`).                                                                                                                            |
+| `data.parameters[].required` | boolean | always                                                                           | `true` when the entry's `required` was truthy — note that a non-empty string, including `"false"`, reports `true` here although publish reads it as `false`. A required parameter with a non-null `default` is still optional on execute.                          |
+| `data.parameters[].default`  | any     | only when the entry has a `default` key (a `null` default is returned as `null`) | As authored. A default containing `${` is published as `NULL` for §10.2.                                                                                                                                                                                           |
+| `data.columns`               | array   | always                                                                           | The publication's column list (`[]` when none): the authored `cfg_data.columns` if it was non-empty at publish, otherwise the output columns discovered from the query.                                                                                            |
+| `data.columns[].name`        | string  | always                                                                           | Derived from the entry's `source`: its second `.`-separated segment (`a.status` → `status`, `a.b.c` → `b`), or the whole value when it has no `.`; `""` when the entry has no `source` (authored columns without `source`). Discovered columns always have a name. |
+| `data.columns[].type`        | string  | always                                                                           | As authored, or for discovered columns the database type name (e.g. `text`, `integer`, `numeric`, `uuid`, `timestamp with time zone`, `character varying(50)`). `""` when absent.                                                                                  |
+
+**Errors**
+
+| Status | Trigger                            | `message` / body                                                                     | Code location |
+| ------ | ---------------------------------- | ------------------------------------------------------------------------------------ | ------------- |
+| 401    | §3                                 | per §3                                                                               | —             |
+| 403    | Caller lacks `view` on `data_view` | `{ "error": "Authorization failed. You don't have access to perform this action." }` | not returned  |
+| 404    | No publication exists for the slug | `No published function data view found for slug "<slug>".`                           | not returned  |
+| 500    | Lookup failed                      | generic `Internal server error`                                                      | not returned  |
+
+**Example**
+
+```bash
+curl "https://pivotly.example.com/api/v3/data-views/dvw-open-orders/definition" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID"
+```
+
+### 10.2 Execute a published data view — POST /v3/data-views/{slug}/execute
+
+- **Classification:** consumer.
+- **Purpose:** run the latest publication with named parameters and return every row.
+- **Headers:** `Authorization: Bearer <JWT>` (!), `Content-Type: application/json` (! when a body is sent), `X-Tenant-Id` (?), `X-App-Slug` (?).
+- **Applicable global rules:** §2; §3 (verb `run`), 403 body shape; §4; §6.5 (parameter names, types, defaults and ordering); §7 execute parameter-key pattern.
+- **Check order:** `[REST]` body + path → `[authz]` → `[service]` publication lookup (404) → `[service]` parameter-key check (400) → run (500 on failure).
+
+**Path parameters**
+
+| Param  | Type   | Req. | Bounds / format                                    |
+| ------ | ------ | ---- | -------------------------------------------------- |
+| `slug` | string | !    | No length or pattern check; exact, case-sensitive. |
+
+**Request body** (optional; an absent or empty body equals `{}`)
+
+```json
+{ "parameters": { "p_status": "open" } }
+```
+
+| Field              | Type                                       | Req.                     | Rule (exact)                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Layer / stage                                 |
+| ------------------ | ------------------------------------------ | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `parameters`       | object                                     | ?                        | JSON object (string keys). Absent → `{}` (every parameter takes its published default).                                                                                                                                                                                                                                                                                                                                                                                       | `[REST]`                                      |
+| `parameters.<key>` | any scalar (string, number, boolean, null) | per published definition | Key must match `^[a-z][a-z0-9_]*$` (else 400) **and** be the name of a published parameter, including its `p_` prefix (an unknown key → 500). Every published parameter without a default (§10.1 `required: true` and no `default`) must be supplied (else 500). The value is bound as a typed query parameter and must be convertible to the parameter's `type` (else 500); `null` passes SQL `NULL`. ⚠️ Not determinable from source: how object or array values are bound. | `[service]` key pattern; platform at run time |
+
+**Effective request contract**
+
+- **Required to send:** path `slug`; in `parameters`, every published parameter that has no default.
+- **Optional:** every other published parameter (defaults: its published `default`, otherwise `NULL`); the whole body.
+- **Ignored:** unknown top-level body keys (stripped).
+- **Runs the publication, not the stored item:** edits saved after the last publish have no effect until §9.1. A soft-deleted (disabled) data view still runs.
+
+**Signature**
+
+`execute(path slug! ; body?{ parameters?{ <p_name>: value } }) — keys ^[a-z][a-z0-9_]*$ and must match published parameter names; parameters without defaults required`
+
+**Success — 200**
+
+```json
+{
+  "data": [
+    {
+      "id": "0c9b8a7d-6e5f-4a3b-2c1d-0e9f8a7b6c5d",
+      "order_no": "SO-10421",
+      "status": "open",
+      "created_at": "2026-09-26T09:14:00.000Z"
+    }
+  ],
+  "meta": {},
+  "status": 200,
+  "error": false,
+  "message": "Data view executed"
+}
+```
+
+- `data` is an array of row objects, one per result row, keyed by the output column names reported by §10.1 when those were discovered from the query. **All** rows are returned — there is no paging, row limit or timeout on this endpoint.
+- ⚠️ Not determinable from source: the exact JSON representation of every database type (for example whether `numeric` or 64-bit integers arrive as numbers or strings).
+
+**Errors**
+
+| Status | Trigger                                                                                                                                                                                                            | `message` / body                                                                        | Code location            |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- | ------------------------ |
+| 400    | Body not an object, or `parameters` not an object                                                                                                                                                                  | issue message or `Schema validation error`                                              | `details[].code` (§11.2) |
+| 400    | A parameter key fails `^[a-z][a-z0-9_]*$` (checked after the publication lookup)                                                                                                                                   | `Invalid parameter name: "<key>"`                                                       | not returned             |
+| 401    | §3                                                                                                                                                                                                                 | per §3                                                                                  | —                        |
+| 403    | Caller lacks `run` on `data_view`                                                                                                                                                                                  | `{ "error": "Authorization failed. You don't have access to perform this action." }`    | not returned             |
+| 404    | No publication exists for the slug                                                                                                                                                                                 | `No published function data view found for slug "<slug>". Publish the data view first.` | not returned             |
+| 500    | Running failed: unknown parameter key, missing required parameter, value not convertible to the parameter type, a run-time error in the query, or the published function was removed by a partial unpublish (§9.2) | `Failed to execute data view "<slug>"`                                                  | not returned             |
+
+**Example**
+
+```bash
+curl -X POST "https://pivotly.example.com/api/v3/data-views/dvw-open-orders/execute" \
+  -H "Authorization: Bearer $TOKEN" -H "X-Tenant-Id: $TENANT_ID" \
+  -H "Content-Type: application/json" \
+  -d '{ "parameters": { "p_status": "open" } }'
+```
+
+**Notes:** read-only. Because there is no row limit, prefer data views whose query bounds its own result size.
+
+## 11. Error codes
+
+### 11.1 Consolidated table
+
+"Where it appears" says how a client can recognize the condition on the wire. **The error envelope has no code field**: most platform conditions are identified only by HTTP status plus `message`. The "Label" column gives the platform's name for a condition where it has one; a label marked _(not returned)_ never appears in the response.
+
+| Label                                                          | HTTP    | Where it appears                                                                                                                                                                                                                                        | Endpoint(s)                             | Meaning / trigger                                                                                                                            |
+| -------------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Request-shape validation                                       | 400     | `message` (single issue text, or `Schema validation error`); issue codes in `details[].code` (§11.2)                                                                                                                                                    | all                                     | A path, query or body field violates its request-layer rule (type, length, range, pattern, enum, required). See each endpoint's field table. |
+| Malformed JSON body                                            | 400     | `message` (parser text)                                                                                                                                                                                                                                 | §8.5, §8.6, §8.7, §10.2                 | Body is not valid JSON.                                                                                                                      |
+| Item type mismatch                                             | 400     | `message` `Item type mismatch: URL specifies "data_view" but body specifies "<t>".`                                                                                                                                                                     | §8.5, §8.6                              | `data.item_type` ≠ `data_view`.                                                                                                              |
+| Id on create                                                   | 400     | `message` `ID should not be provided for creation. Use PATCH for updates.`                                                                                                                                                                              | §8.5                                    | `data.id` or `parameters.id` sent.                                                                                                           |
+| Id mismatch                                                    | 400     | `message` `ID mismatch between URL and body.`                                                                                                                                                                                                           | §8.6                                    | `data.id` / `parameters.id` ≠ path id.                                                                                                       |
+| Invalid execute parameter name                                 | 400     | `message` `Invalid parameter name: "<key>"`                                                                                                                                                                                                             | §10.2                                   | A `parameters` key fails `^[a-z][a-z0-9_]*$`.                                                                                                |
+| `USER_NOT_IN_IAM`                                              | 401     | `meta.code`                                                                                                                                                                                                                                             | all                                     | Valid token, but no registered platform user.                                                                                                |
+| Authentication failure                                         | 401     | `message`                                                                                                                                                                                                                                               | all                                     | Missing/invalid bearer token (§3).                                                                                                           |
+| Authorization — unresolved object type                         | 403     | non-envelope body `{ "error": "Authorization Failed. Incorrect config or invalid id was provided" }`                                                                                                                                                    | §8.1                                    | `itemType` missing or empty.                                                                                                                 |
+| Authorization — denied                                         | 403     | non-envelope body `{ "error": "Authorization failed. You don't have access to perform this action." }`                                                                                                                                                  | all                                     | The caller's roles do not grant the endpoint's verb on `data_view` (§3).                                                                     |
+| Config item not found                                          | 404     | `message` `Config item not found`                                                                                                                                                                                                                       | §8.3, §8.7                              | No item with the id.                                                                                                                         |
+| Config item type mismatch                                      | 404     | `message` `Config item type mismatch: expected data_view, got <type> not found`                                                                                                                                                                         | §8.3, §8.7                              | The id belongs to another type.                                                                                                              |
+| Slug not found                                                 | 404     | `message` `data_view with slug "<slug>" not found`                                                                                                                                                                                                      | §8.2                                    | No data view with the slug.                                                                                                                  |
+| `NOT_FOUND` _(not returned)_                                   | 404     | `message` `Data view "<slug>" not found.`                                                                                                                                                                                                               | §9.1                                    | No data view config item with the slug.                                                                                                      |
+| No publication                                                 | 404     | `message` `No published function data view found for slug "<slug>".` (§10.1) / `... Publish the data view first.` (§10.2)                                                                                                                               | §10.1, §10.2                            | No completed publication exists for the slug.                                                                                                |
+| `INVALID` _(not returned)_ — data-view validation failed       | **500** | `message` `Validation failed`; every violation in `details[]` with its code in `details[].code` (§11.3); `meta` = `{ action, id, slug, item_type }`                                                                                                     | §8.5, §8.6, §8.7                        | One or more §6 save rules failed.                                                                                                            |
+| Slug taken (same type) _(not returned)_                        | **500** | `message` states the slug already exists and quotes the existing item's id                                                                                                                                                                              | §8.5 (and §8.6 unknown id)              | `data.slug` already used by a data view.                                                                                                     |
+| Slug taken (other type) _(not returned)_                       | **500** | `message` `Slug "<slug>" already exists with item_type "<type>"; cannot save as "data_view".`                                                                                                                                                           | §8.5 (and §8.6 unknown id)              | `data.slug` used by another type.                                                                                                            |
+| Slug changed _(not returned)_                                  | **500** | `message` `Slug mismatch for id <id> (existing="<a>", provided="<b>")`                                                                                                                                                                                  | §8.6, §8.7                              | Sent slug ≠ stored slug.                                                                                                                     |
+| Item type changed _(not returned)_                             | **500** | `message` `Item type conflict for slug "<slug>" (existing="<t>", provided="data_view")`                                                                                                                                                                 | §8.6                                    | The id belongs to another type.                                                                                                              |
+| Storage not-null violation _(not returned)_                    | **500** | `message` names the column                                                                                                                                                                                                                              | §8.6, §8.7                              | `enabled: null` or empty `full_path` on update.                                                                                              |
+| Non-uuid id on update _(not returned)_                         | **500** | `message` `Internal server error` (production)                                                                                                                                                                                                          | §8.6                                    | Path `id` not a uuid.                                                                                                                        |
+| Lookup/query failure _(not returned)_                          | **500** | `message` `Failed to fetch config items by columns` / `Failed to fetch config item by slug` / `Failed to fetch config item` / `Failed to fetch config items` / `Failed to fetch published data views` / `Failed to fetch paginated publication history` | §8.1, §8.2, §8.3/§8.7, §8.4, §9.3, §9.4 | Invalid filter value for the field's type, non-uuid id, or a platform failure.                                                               |
+| `MISSING_PARAM` _(not returned)_                               | **500** | `message` `Missing required parameter: slug.`                                                                                                                                                                                                           | §9.1, §9.2                              | Empty path slug.                                                                                                                             |
+| `INVALID_SLUG` _(not returned)_                                | **500** | `message` `Use lowercase letters, digits, hyphens, or underscores; start with a letter.`; `meta.slug`                                                                                                                                                   | §9.1                                    | Stored slug fails `^[a-z][a-z0-9_-]{0,127}$`.                                                                                                |
+| `INVALID_CFG_DATA` _(not returned)_                            | **500** | `message` (one of the §9.1 rule 4–8, 10 texts)                                                                                                                                                                                                          | §9.1                                    | Invalid `implementation` / `authoring_mode`, empty body for the mode, parameter without name, invalid parameter type.                        |
+| `INVALID_PARAMETER_NAME_PREFIX` _(not returned at publish)_    | **500** | `message` quoting the name and `^p_[a-z][a-z0-9_]*$`                                                                                                                                                                                                    | §9.1                                    | A parameter name fails the pattern. (At save the same code appears in `details[].code`, §11.3.)                                              |
+| `INVALID_SQL_DDL_KEYWORD` _(not returned at publish)_          | **500** | `message` `Remove the DDL/DML keyword or refactor as a parameterized SELECT.`; `meta.keyword`                                                                                                                                                           | §9.1                                    | §6.3 keyword rule.                                                                                                                           |
+| `INVALID_SQL_BASE_TABLE_REFERENCE` _(not returned at publish)_ | **500** | `message` `Replace usdf.clients_b with usdf.clients (etc.).`                                                                                                                                                                                            | §9.1                                    | §6.3 base-table rule.                                                                                                                        |
+| `INVALID_FILTER_OP` _(not returned at publish)_                | **500** | `message` `Unsupported filter operator: "<op>"`                                                                                                                                                                                                         | §9.1                                    | Builder filter `op` outside the set.                                                                                                         |
+| `PUBLISH_FAILED` _(not returned)_                              | **500** | `message` in one of the forms of §9.1 rule 15 (or the conversion error of rule 11); `meta.slug`                                                                                                                                                         | §9.1                                    | Unreadable `required`, or compilation / column discovery / function creation failed (§9.1 rules 11, 15).                                     |
+| `UNPUBLISH_FAILED` _(not returned)_                            | **500** | `message` = underlying reason text; `meta.slug`                                                                                                                                                                                                         | §9.2                                    | Unexpected unpublish failure.                                                                                                                |
+| Execution failure _(not returned)_                             | **500** | `message` `Failed to execute data view "<slug>"`                                                                                                                                                                                                        | §10.2                                   | Unknown/missing parameter, unconvertible value, run-time query error, removed function.                                                      |
+| Authorization check failure                                    | **500** | `message` (generic)                                                                                                                                                                                                                                     | all                                     | The permission check itself failed (e.g. `X-Tenant-Id` not a uuid).                                                                          |
+
+**4xx vs 5xx.** Only request-shape problems, the API-side type/id checks, authentication, authorization and not-found conditions return 4xx. **Every platform-side validation and state rejection** — duplicate slug, slug or type change, data-view validation, every publish check except "not found", and execution failures — currently surfaces as **500** carrying a descriptive `message` (and, for save validation, `details[]`). Clients must treat a 500 with `details[]` or a recognizable `message` as a caller error, not a transient fault; do not retry such requests unchanged.
+
+### 11.2 Request-layer issue codes (`details[].code` on 400)
+
+Each `details[]` entry is `{ field: string, message: string, code: string }`, where `field` is the dotted path of the offending value (e.g. `data.slug`, `data.cfg_data`, `pageSize`, `parameters`) and `message` is the rule's text. Codes that the endpoints in this document can produce:
+
+| Code             | Trigger                                                                                                                                                                                       |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `invalid_type`   | Missing required field, `null` where not allowed, wrong JSON type (e.g. `cfg_data` an array or string, `name: null`, `enabled: "yes"`), or a non-numeric value for a numeric query parameter. |
+| `too_small`      | Below a minimum: empty `slug` / `item_type` / path `slug` (§8.2) / path `id`; `page` below its minimum; `pageSize` < 1; `version` ≤ 0.                                                        |
+| `too_big`        | Above a maximum: `slug` > 255, `item_type` > 100, `name` > 255, `description` > 1000, `full_path` > 500, `pageSize` above its maximum, `limit` > 100.                                         |
+| `invalid_format` | `id`, `parameters.id` or `parent_item_id` not matching the uuid pattern (`Invalid UUID format`).                                                                                              |
+| `invalid_value`  | `fetchType` not `list` / `paginated`.                                                                                                                                                         |
+
+A non-integer value for an integer parameter (e.g. `page=1.5`, `version: 1.5`) is rejected with `invalid_type` (expected an integer).
+
+### 11.3 Data-view validation sub-codes (`details[].code` on the 500 `Validation failed`)
+
+Each entry is `{ path, code, detail, severity, remediation, current?, proposed? }`: `path` (string, JSON-path style such as `$.cfg_data.parameters[2].name`), `code` (below), `detail` (string), `severity` (always `error`), `remediation` (`none` \| `rename_and_retry` \| `drop_and_recreate`), `current` (the offending value, when included), `proposed` (the sent value, on immutability rules). All violations are reported together.
+
+| Code                               | Path                                                | Triggering rule (exact)                                                                                                                                                                                                                                                             | Remediation         | Defined in |
+| ---------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- | ---------- |
+| `REQUIRED`                         | `$.name` (also defined for `$.slug`, `$.item_type`) | The resolved `name` is empty: fires on update or soft-delete when `name` is sent empty or whitespace-only (on create an empty `name` defaults to the slug). The `$.slug` / `$.item_type` variants cannot occur through these endpoints — an empty slug or type is rejected earlier. | `none`              | §6.1       |
+| `VALUE`                            | `$.slug`                                            | Slug longer than 128 chars or not matching `^[a-z][a-z0-9_-]{0,127}$`.                                                                                                                                                                                                              | `rename_and_retry`  | §6.1       |
+| `VALUE`                            | `$.cfg_data.authoring_mode`                         | Present and not `builder` / `direct_sql`.                                                                                                                                                                                                                                           | `none`              | §6.2       |
+| `VALUE`                            | `$.cfg_data.implementation`                         | Present and not `function` / `view`.                                                                                                                                                                                                                                                | `none`              | §6.2       |
+| `RESERVED_PREFIX_SYS`              | `$.slug`                                            | Slug starts with `sys_`.                                                                                                                                                                                                                                                            | `rename_and_retry`  | §6.1       |
+| `RESERVED_PREFIX_DTM_DTV`          | `$.slug`                                            | Slug starts with `dtm_`, `dtm-`, `dtv_` or `dtv-`.                                                                                                                                                                                                                                  | `rename_and_retry`  | §6.1       |
+| `TYPE`                             | `$.cfg_data`                                        | `cfg_data` is not a JSON object (when this fires, no other `cfg_data` rule runs).                                                                                                                                                                                                   | `none`              | §6.1       |
+| `TYPE`                             | `$.cfg_data.parameters`                             | `parameters` present (including `null`) and not an array.                                                                                                                                                                                                                           | `none`              | §6.5       |
+| `INVALID_DATA_VIEW_AREA`           | `$.cfg_data.area` or `$.cfg_data.area[<n>]`         | `area` present and: a blank/whitespace string; an empty array; an array element that is not a string or is blank (only the first bad element is reported); or any other JSON type, `null` included.                                                                                 | `none`              | §6.2       |
+| `SLUG_DENORM_MATCH`                | `$.cfg_data.slug`                                   | `cfg_data.slug` non-empty and ≠ outer slug (`current` = `cfg_data.slug`, `proposed` = outer slug).                                                                                                                                                                                  | `rename_and_retry`  | §6.2       |
+| `AUTHORING_MODE_REQUIRES_BODY`     | `$.cfg_data.direct_sql`                             | `authoring_mode = "direct_sql"` and `direct_sql` absent/`null`/`""`.                                                                                                                                                                                                                | `none`              | §6.3       |
+| `AUTHORING_MODE_REQUIRES_BODY`     | `$.cfg_data.builder`                                | `authoring_mode = "builder"` and `builder` is not an object, or `builder.sources` is not a non-empty array.                                                                                                                                                                         | `none`              | §6.4       |
+| `INVALID_SQL_DDL_KEYWORD`          | `$.cfg_data.direct_sql`                             | `authoring_mode = "direct_sql"` and the body contains, as a whole word (case-insensitive), a keyword from the §7 list; one entry per keyword found, `current` = keyword.                                                                                                            | `none`              | §6.3       |
+| `INVALID_SQL_BASE_TABLE_REFERENCE` | `$.cfg_data.direct_sql`                             | `authoring_mode = "direct_sql"` and the body matches `usdf\.[a-z][a-z0-9_]*_(b\|c)` at a word end (case-insensitive).                                                                                                                                                               | `none`              | §6.3       |
+| `INVALID_SOURCE_DOMAIN`            | `$.cfg_data.builder.sources[<n>]`                   | `builder` is an object, `sources` is an array, and source `<n>` is an object with none of `domain`, `view_slug`, `data_view_slug` non-empty.                                                                                                                                        | `none`              | §6.4       |
+| `INVALID_FILTER_OP`                | `$.cfg_data.builder.filters[<n>].op`                | Filter `<n>` is an object with a non-empty `op` outside `equals`, `not equals`, `greater than`, `less than`, `in`, `is null`, `is not null`.                                                                                                                                        | `none`              | §6.4       |
+| `INVALID_PARAMETER_NAME_PREFIX`    | `$.cfg_data.parameters[<n>].name`                   | Parameter `<n>` has a non-empty `name` not matching `^p_[a-z][a-z0-9_]*$`.                                                                                                                                                                                                          | `rename_and_retry`  | §6.5       |
+| `INVALID_PARAMETER_TYPE`           | `$.cfg_data.parameters[<n>].type`                   | Parameter `<n>` has a non-empty `type` outside `text`, `integer`, `uuid`, `boolean`, `numeric`, `date`, `timestamptz`.                                                                                                                                                              | `none`              | §6.5       |
+| `DUPLICATE_PARAMETER_NAME`         | `$.cfg_data.parameters`                             | Two or more object entries share the same non-empty `name` (case-sensitive); one entry per duplicated name, `current` = the name.                                                                                                                                                   | `rename_and_retry`  | §6.5       |
+| `DUPLICATE_COLUMN_NAME`            | `$.cfg_data.columns`                                | `columns` is an array and two or more object entries share the same non-empty `name` (case-sensitive); one entry per duplicated name.                                                                                                                                               | `rename_and_retry`  | §6.6       |
+| `IMMUTABLE_SLUG_DENORM`            | `$.cfg_data.slug`                                   | A completed publication exists for the slug and `cfg_data.slug` is non-empty and ≠ outer slug (always accompanies `SLUG_DENORM_MATCH`).                                                                                                                                             | `drop_and_recreate` | §6.7       |
+| `IMMUTABLE_IMPLEMENTATION`         | `$.cfg_data.implementation`                         | A completed publication exists and `cfg_data.implementation` is present and ≠ that publication's implementation (`function`).                                                                                                                                                       | `drop_and_recreate` | §6.7       |
+| `INVALID`                          | `$`                                                 | The validator could not evaluate the payload; `detail` carries the underlying reason. In this case the 500's `message` is the underlying error text (**not** `Validation failed`) and `details[]` holds only this one entry.                                                        | `none`              | —          |
+
+## 12. Coverage checklist
+
+| Inventory # | Method & path                                       | Section |
+| ----------- | --------------------------------------------------- | ------- |
+| 1           | `GET /api/v3/config-items?itemType=data_view`       | §8.1    |
+| 2           | `GET /api/v3/config-items/data_view/by-slug/{slug}` | §8.2    |
+| 3           | `GET /api/v3/config-items/data_view/{id}`           | §8.3    |
+| 7           | `GET /api/v3/config-items/data_view`                | §8.4    |
+| 4           | `POST /api/v3/config-items/data_view`               | §8.5    |
+| 5           | `PATCH /api/v3/config-items/data_view/{id}`         | §8.6    |
+| 6           | `DELETE /api/v3/config-items/data_view/{id}`        | §8.7    |
+| 8           | `POST /api/v3/data-views/{slug}/publish`            | §9.1    |
+| 11          | `DELETE /api/v3/data-views/{slug}/unpublish`        | §9.2    |
+| 9           | `GET /api/v3/data-views/publications`               | §9.3    |
+| 10          | `GET /api/v3/data-views/{slug}/publications`        | §9.4    |
+| 12          | `GET /api/v3/data-views/{slug}/definition`          | §10.1   |
+| 13          | `POST /api/v3/data-views/{slug}/execute`            | §10.2   |
+
+13 of 13 selected endpoints are documented.
+
+## 13. Excluded from this document
+
+Discovered in the inventory and not selected:
+
+| #   | Method & path                       | Reason                                                                                         |
+| --- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| 14  | `GET /api/v3/views/{viewName}`      | Legacy run-by-name path (parameters as query-string values); it has no authorization check.    |
+| 15  | `GET /api/v3/views/{viewName}/{id}` | Legacy single-row read by id for data views published as views; it has no authorization check. |
+
+Endpoints that only take a data view as an input (picklist values and resolve, process render, report preview and execution) belong to those config items' references.
+
+## 14. Open questions / notes
+
+**Revision.** `doc_revision` 2026-09-28-r2. This document was generated fresh from the backend and database code in this run; no content was carried over from any earlier revision.
+
+**Verification.** An independent re-derivation against the code was performed on the draft (request schemas bound to each route, the declared data-view schema and rule list, the running save, validator, publish and unpublish logic, the error mapper and error handler), covering field and rule content, declared-vs-running rule reconciliation in both directions, error status and wire location, example validity, the create/update/soft-delete effective contracts, nested sub-field requiredness, request-layer strictness, enforcement stages, parameter bounds, layout and leaks. It confirmed the function versions used are current (none dropped later), the update and soft-delete contracts, the 500-mapping of save/publish failures, the non-envelope 403 bodies, every §11.3 validation code with its predicate, path and remediation, the publish rule messages, and the publication/definition/execute behaviour. It reported defects that were then fixed in this revision: the column-discovery publish failure message form (§9.1 rule 15), the position of the `required` check in the publish order (rule 11), the token-failure message (§3), the operator count (§7), `parentItemId` always `null`, create-vs-update trimming and `""` handling (§6.1, §6.2, §6.4, §8.5), `null` parameter defaults, the definition column-name derivation, the zero-row run during publish, `status` substring filters (§9.4), the filter-op check requiring a primary source, the `env:` namespace source, the body-size limit and 413/415 responses (§2), the §4 error example, and additional declared-vs-running gaps (items 4, 6, 8, 9 below). After the fixes the doc was re-checked against the same code for these items.
+
+**Declared rules vs the running validator** (the platform states the data-view contract twice; they were merged, and the code wins where they differ):
+
+1. _Renamed code._ The declared rule `INVALID_PARAMETER_NAME` is raised by the running validator as `INVALID_PARAMETER_NAME_PREFIX` (same pattern `^p_[a-z][a-z0-9_]*$`). This document uses the code actually returned.
+2. _Declared but not enforced._ `IMMUTABLE_PARAMETER_SIGNATURE` is declared, but the running validator no longer enforces it; parameter signatures may change after publishing (the next publish replaces the function). Not documented as a rule.
+3. _Different predicate._ Declared `INVALID_SOURCE_DOMAIN`: "a non-empty `domain` that does not match the slug pattern". Running rule: "a source object with none of `domain`, `view_slug`, `data_view_slug` non-empty"; no pattern is checked. Documented as the running rule.
+4. _Keyword list wording._ The declared rule's prose list of DDL/DML keywords omits `MERGE`; the declared keyword constant, the validator and publish all include it. Documented with `MERGE`.
+5. _Wording/strictness._ Declared base-table pattern `usdf\.\w+_b\b` / `_c\b`; the validator uses `usdf\.[a-z][a-z0-9_]*_(b|c)` and publish `\musdf\.[a-z_][a-z0-9_]*_(b|c)\M` (all case-insensitive). The reserved-prefix rules are declared case-insensitive and run case-sensitively — equivalent in practice because slugs must be lowercase. `IMMUTABLE_SLUG_DENORM` is declared against the previous publication's `cfg_data.slug`; it actually fires whenever `SLUG_DENORM_MATCH` does and a publication exists. `IMMUTABLE_IMPLEMENTATION` is declared against the previous `cfg_data.implementation`; it actually compares with the publication's recorded implementation, which is always `function`.
+6. _Different remediation / predicate._ `INVALID_SOURCE_DOMAIN` is declared with remediation `rename_and_retry` but returned with `none`; `INVALID_PARAMETER_TYPE` is declared `rename_and_retry` but returned with `none`, and is declared as "type not in the enum" while the validator checks only non-empty types. Documented as returned.
+7. _Enforced but not declared._ `INVALID_DATA_VIEW_AREA` (the `area` field is not in the declared schema at all), plus the structural codes `REQUIRED`, `VALUE`, `TYPE`, `INVALID`. Documented from the code; the declared rule list could be back-filled.
+8. _Declared structure not enforced by the running validator_ (documented as "expected; not enforced"): `authoring_mode` is declared required; unknown `cfg_data` keys are declared forbidden; `builder.columns` declared required and `builder.limit` an integer ≥ 1; parameter `name`/`type` declared required and `name` 3–63 chars; source `domain`/`alias`/`role` declared required, `alias` pattern `^[a-z][a-z0-9_]*$` ≤ 16 chars, `role` and `join_type` enums; builder column `source`/`attribute` required; filter `column`/`op`/`value` required and `logic` enum (`WHERE`, `AND`, `OR`); column `name` required and ≤ 63 chars, column `type` enum; `builder.sort` / `builder.limit` / column `sort` shapes.
+9. _Declared behaviour that the code does not have:_ parameters referenced in SQL as `:p_<name>` (unsupported — reference by bare name or position); `join_type` defaulting to `LEFT JOIN` when empty (only when absent); a parameter `default` applying only when `required` is false (it applies regardless); publish "prefers `alias` over `name`" for `cfg_data.columns` (columns are never used to compile); `implementation: "view"` producing a view (publish always creates a function); `_runtime` populated on read (not by these endpoints); `builder.sort` / `limit` compiling to `ORDER BY` / `LIMIT` (they are ignored).
+
+**Request layer vs platform** (the combined, stricter rule is what §6/§8 document):
+
+- `slug`: request layer 1–255 chars; platform ≤ 128 + pattern + reserved prefixes + global uniqueness. 129–255 chars passes the request layer and fails at save (500).
+- `name`: optional at the request layer (not nullable); required by the validator, satisfied on create by defaulting to the slug; on update an empty value fails.
+- `enabled`: nullable at the request layer; `null` on update violates storage (500); on create `null` defaults to `true`.
+- `full_path`: empty on update violates storage (500).
+- `version`: validated at the request layer (positive integer) and then ignored.
+- Update: the update route reuses the create body shape, so `slug`, `item_type`, `cfg_data` are required-to-send although the platform patch-merges omitted fields.
+
+**Behaviours worth confirming with the platform owners** (documented as the code behaves today):
+
+1. Soft-delete (§8.7) only disables the item; the platform's update step resets the deleted flag, so no data view is ever marked deleted through this API. A disabled data view can still be published and executed.
+2. Unpublish (§9.2) removes one publication record per call while every publish appends one; after a single unpublish, execute targets a removed function (500) until the call is repeated.
+3. `PATCH` with an unknown uuid creates a new data view with that id (§8.6).
+4. All platform validation and state rejections return 500; platform error codes are not returned except as `details[].code` on save validation (§11).
+5. Authorization failures return a non-envelope `{ "error": ... }` body (§3).
+6. When `authoring_mode` is absent, neither save nor publish applies the DDL/DML keyword and base-table checks to `direct_sql` (§6.8).
+7. The builder `in` operator cannot compile; qualified builder filter columns (`a.status`) cannot compile; builder `sort` / `limit` are ignored (§6.4).
+8. Builder `join_type`, `join_on` and filter `logic`, and the parameter `data_type` alias, are emitted into the compiled query without validation (§6.4, §6.5).
+9. Slugs that derive the same published name (`dvw-x`, `dvw_x`, `x`, and `-`/`_` variants) overwrite each other's published function (§7).
+10. Execute has no row limit or timeout (§10.2).
+11. Parameter defaults containing `${` are published as `NULL` and are not resolved by §10.2.
+12. The read layer maps `parent_item_id` as a number although it is stored as a uuid, so read endpoints always return `parentItemId: null` (§8).
+13. Authorization on §8.1 runs before request validation and is evaluated against whatever `itemType` is supplied.
+14. Create does not trim text fields while update does (whitespace-only `name` / `full_path` are stored on create; `description: ""` is stored as `""` on create and as `null` on update).
+15. `""` for `authoring_mode`, `implementation` or a builder filter `op` passes save (treated as absent) but fails publish.
+16. A publish failure during column discovery returns a message that begins with an internal step label (§9.1 rule 15, form a); clients should match on `column introspection failed`.
+
+**Deliberate caller-visible names.** `direct_sql` is SQL the caller writes, so it must name the domain read views as `usdf.<domain_slug>`; the platform's own validation messages use that form, and published object names (`db_object_name`) appear in responses. These are part of the external contract and are documented as such.
+
+**⚠️ Not determinable from source:** whether the §8.1 `parentItemId` filter can match; the offset used in save-response timestamps (session time zone); how object/array execute parameter values are bound; the exact JSON representation of each database type in execute results.

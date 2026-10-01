@@ -1,11 +1,22 @@
 {
   "mcpServers": {
     "pivotly-mcp-server": {
-      "type": "http",
-      "url": "http://localhost:8080/mcp",
-      "headers": {
-        "Authorization": "Bearer ${PIVOTLY_MCP_TOKEN}"
-      }
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://app-sbx-mcp-authtest-cus-001.azurewebsites.net/mcp",
+        "33418",
+        "--callback-path",
+        "/callback",
+        "--static-oauth-client-info",
+        "{\"client_id\":\"75ac184d-59c7-4543-9201-acc044f68269\"}",
+        "--static-oauth-client-metadata",
+        "{\"scope\":\"api://459f7779-d2f4-447c-a34d-7f3f8283d8ef/mcp.invoke offline_access\"}",
+        "--disable-resource-parameter",
+        "--auth-timeout",
+        "120"
+      ]
     }
   }
 }

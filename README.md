@@ -1,12 +1,11 @@
 # Pivotly client setup
 
-@pivotly/plugin 0.0.0 · sha256:1a56e715235c
+@pivotly/plugin 0.0.0 · sha256:af2c18056f21
 
-Set first:
+Pinned to https://app-sbx-mcp-authtest-cus-001.azurewebsites.net/mcp — nothing to set.
 
-```bash
-export PIVOTLY_MCP_TOKEN=<your-token>
-```
+Sign-in happens in your client: the first connection opens a browser window (in
+Claude, via the `npx mcp-remote` bridge, which needs Node). There is no token to set.
 
 ## Install
 
@@ -56,4 +55,4 @@ nothing reports an error.
 - GitHub Copilot plugin — copilot/mcp.json
 - Windsurf — windsurf/.windsurf/mcp_config.json
 
-Skills: domain, hello-world
+Skills: hello-world, manage-data-view, manage-domain

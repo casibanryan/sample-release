@@ -62,7 +62,7 @@ First contact with the Pivotly plugin. Says hello, then reports what is actually
 
 ---
 
-## Reference: TEST.md
+## File: references/TEST.md
 
 ##TEST
 
